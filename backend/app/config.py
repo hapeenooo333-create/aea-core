@@ -9,9 +9,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    app_name: str = "AEA Core API"
-    supabase_url: str | None = Field(default=None, alias="SUPABASE_URL")
-    supabase_anon_key: str | None = Field(default=None, alias="SUPABASE_ANON_KEY")
+    """Application settings loaded from environment variables and the backend .env file."""
+
+    app_name: str = "AEA Core"
+    supabase_url: str = Field(default="", alias="SUPABASE_URL")
+    supabase_anon_key: str = Field(default="", alias="SUPABASE_ANON_KEY")
+    debug: bool = False
 
     model_config = SettingsConfigDict(
         env_file=str(Path(__file__).resolve().parents[1] / ".env"),
@@ -19,13 +22,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    @property
-    def is_supabase_configured(self) -> bool:
-        return bool(self.supabase_url and self.supabase_anon_key)
-
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Return a cached singleton instance of the application settings."""
+
     return Settings()
 
 
