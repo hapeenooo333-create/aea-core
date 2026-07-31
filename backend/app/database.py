@@ -17,6 +17,12 @@ class DatabaseError(RuntimeError):
     """Raised when the Supabase client cannot be initialized."""
 
 
+def is_supabase_configured() -> bool:
+    """Return whether the Supabase environment variables are present."""
+
+    return bool(settings.supabase_url and settings.supabase_anon_key)
+
+
 @lru_cache(maxsize=1)
 def get_supabase_client() -> Client:
     """Create and cache the singleton Supabase client instance."""
@@ -40,6 +46,6 @@ def get_supabase_client() -> Client:
 
 supabase_client: Final[Client] = get_supabase_client()
 
-__all__ = ["DatabaseError", "get_supabase_client", "supabase_client"]
+__all__ = ["DatabaseError", "get_supabase_client", "is_supabase_configured", "supabase_client"]
 
                                                                                                                                                                                     

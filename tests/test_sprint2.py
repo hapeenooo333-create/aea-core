@@ -5,6 +5,8 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
+import app.main as main_module
+
 from app.main import app
 
 
@@ -32,3 +34,23 @@ def test_workers_endpoint_returns_mock_data_when_supabase_is_unavailable() -> No
     payload = response.json()
     assert isinstance(payload, list)
     assert payload[0]["name"] == "Atlas"
+
+
+def test_create_worker_reports_supabase_errors(monkeypatch) -> None:
+    class FailingTable:
+        def insert(self, payload):
+            raise RuntimeError("new row violates row-level security policy")
+
+    class FailingClient:
+        def table(self, _name):
+            return FailingTable()
+
+    monkeypatch.setattr(main_module, "supabase_client", FailingClient())
+
+    response = client.post(
+        "/workers",
+        json={"name": "Test Bot", "role": "affiliate", "status": "active"},
+    )
+
+    assert response.status_code == 500
+    assert "row-level security policy" in response.json()["detail"]
