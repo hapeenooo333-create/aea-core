@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.config import settings
 from app.database import is_supabase_configured, supabase_client
+from app.routers.atlas import router as atlas_router
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,8 @@ app = FastAPI(
     version="0.1.0",
     description="Initial backend for AEA Core",
 )
+
+app.include_router(atlas_router)
 
 MOCK_WORKERS = [
     {"id": 1, "name": "Atlas", "role": "CEO", "status": "active"},
