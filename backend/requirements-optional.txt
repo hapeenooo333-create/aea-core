@@ -1,0 +1,10 @@
+# Optional LLM provider dependencies.
+# These are NOT required for default runtime (MockLLMProvider is the default).
+# Install only if you intend to use a real provider.
+#
+# Groq:
+#   pip install groq
+#
+# These packages are imported lazily inside BaseLLMProvider implementations
+# (see backend/app/services/llm_provider.py). The application continues to
+# start and operate with MockLLMProvider when they are absent.
