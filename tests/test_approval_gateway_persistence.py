@@ -68,7 +68,9 @@ class TestApprovalGatewayPersistence:
         mock_client.table.assert_called()
 
     def test_create_request_fallback_to_memory(self) -> None:
-        """Test creating request falls back to memory when database fails."""
+        """P1-2: real DB errors are surfaced; only ``db_unavailable`` falls
+        back to the in-memory dict. A generic ``Exception`` is a real DB
+        error and the gateway must NOT silently swap to stale memory."""
         gateway = ApprovalGateway()
         mock_client = MagicMock()
         mock_client.table().insert().execute.side_effect = Exception("DB error")
@@ -81,11 +83,11 @@ class TestApprovalGatewayPersistence:
             payload={"message": "hello"},
         )
 
-        assert result["success"] is True
-        assert result["request"]["status"] == "pending"
-        # Verify it was stored in memory
-        request_id = result["request"]["id"]
-        assert request_id in gateway._memory_store
+        # The error is propagated, not swallowed.
+        assert result["success"] is False
+        assert "db_error" in result["error"]
+        # No silent write to memory.
+        assert gateway._memory_store == {}
 
     def test_create_request_no_database(self) -> None:
         """Test creating request when no database is available."""
@@ -164,23 +166,33 @@ class TestApprovalGatewayPersistence:
         assert all(r["mission_id"] == "mission-1" for r in mission1_requests)
 
     def test_approve_request_updates_database(self) -> None:
-        """Test approving a request updates database."""
+        """Test approving a request updates database via atomic compare-and-set."""
         gateway = ApprovalGateway()
         mock_client = MagicMock()
+        # Create path: insert returns a row containing the new id.
         mock_client.table().insert().execute.return_value = MagicMock(data=[{"id": "test-123"}])
+        # Approve path: the gateway performs a ``.update().eq(id).eq(status).execute()``
+        # compare-and-set. The mock returns the post-update row.
+        updated_row = {
+            "id": "test-123",
+            "mission_id": "mission-1",
+            "action_type": "send_message",
+            "risk_level": "sensitive",
+            "status": "approved",
+            "requested_at": "2024-01-01T00:00:00+00:00",
+            "expires_at": "2024-01-02T00:00:00+00:00",
+            "approved_at": "2024-01-01T01:00:00+00:00",
+            "approved_by": "user-1",
+            "metadata": {},
+        }
+        mock_client.table().update().eq().eq().execute.return_value = MagicMock(
+            data=[updated_row]
+        )
+        # Probe path: the compare-and-set may re-read the row when the
+        # update matches zero rows. The mock returns a pending row so the
+        # probe path is exercised but does not affect the happy path.
         mock_client.table().select().eq().limit().execute.return_value = MagicMock(
-            data=[
-                {
-                    "id": "test-123",
-                    "mission_id": "mission-1",
-                    "action_type": "send_message",
-                    "risk_level": "sensitive",
-                    "status": "pending",
-                    "requested_at": "2024-01-01T00:00:00+00:00",
-                    "expires_at": "2024-01-02T00:00:00+00:00",
-                    "metadata": {},
-                }
-            ]
+            data=[dict(updated_row, status="pending")]
         )
         gateway._client = mock_client
 
