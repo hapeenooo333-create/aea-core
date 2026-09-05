@@ -25,6 +25,8 @@ class FakeTable:
         self._method = "select"
         self._order_column: str | None = None
         self._order_desc = False
+        self._filter_column: str | None = None
+        self._filter_value: str | None = None
 
     def select(self, *_args, **_kwargs):
         self._method = "select"
@@ -33,6 +35,16 @@ class FakeTable:
     def insert(self, payload: dict):
         self._method = "insert"
         self._payload = payload
+        return self
+
+    def update(self, payload: dict):
+        self._method = "update"
+        self._payload = payload
+        return self
+
+    def eq(self, column: str, value):
+        self._filter_column = column
+        self._filter_value = value
         return self
 
     def order(self, column: str, desc: bool = False):
@@ -51,6 +63,14 @@ class FakeTable:
                 row.setdefault("updated_at", row["created_at"])
             self.client.data[self.table_name].append(row)
             return FakeResponse([row])
+
+        if self._method == "update":
+            rows = [dict(item) for item in self.client.data[self.table_name]]
+            for row in rows:
+                if str(row.get(self._filter_column or "")) == str(self._filter_value or ""):
+                    row.update(self._payload or {})
+                    row.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
+            return FakeResponse(rows)
 
         rows = [dict(item) for item in self.client.data[self.table_name]]
         if self._order_column:
@@ -80,19 +100,33 @@ def test_atlas_mission_flow(monkeypatch):
             "/atlas/mission",
             json={
                 "title": "Growth campaign",
-                "goal": "Launch an affiliate campaign for Pinterest traffic",
-                "target_products": 3,
-                "target_pins": 12,
-                "campaign_name": "summer-promo",
+                "description": "Launch an affiliate campaign for Pinterest traffic",
+                "assigned_worker": "worker-1",
+                "priority": "high",
             },
         )
 
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["mission_id"] is not None
-        assert body["steps"][0]["step_name"] == "Research Worker"
-        assert body["first_command"]["command_type"] == "START_RESEARCH"
+        assert body["title"] == "Growth campaign"
+        assert body["priority"] == "high"
 
         missions_response = client.get("/atlas/missions")
         assert missions_response.status_code == 200, missions_response.text
         assert len(missions_response.json()) == 1
+
+        mission_id = body["id"]
+        detail_response = client.get(f"/atlas/missions/{mission_id}")
+        assert detail_response.status_code == 200, detail_response.text
+        assert detail_response.json()["title"] == "Growth campaign"
+
+        patch_response = client.patch(
+            f"/atlas/missions/{mission_id}",
+            json={"status": "in_progress", "progress": 25, "result": {"note": "started"}},
+        )
+        assert patch_response.status_code == 200, patch_response.text
+        patched = patch_response.json()
+        assert patched["status"] == "in_progress"
+        assert patched["progress"] == 25
+        assert patched["result"] == {"note": "started"}
