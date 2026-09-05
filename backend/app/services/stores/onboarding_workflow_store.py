@@ -17,6 +17,7 @@ expected to carry non-sensitive context only.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any
 from uuid import uuid4
 
@@ -44,6 +45,10 @@ class OnboardingWorkflowStore:
         """
         self._explicit_client = client
         self._memory_store: dict[str, dict[str, Any]] = {}
+        # Lock that serializes get_or_create_for_approval across threads
+        # in this process. The database is the durable authority; this
+        # lock only protects the in-memory fallback from a TOCTOU race.
+        self._memory_lock = RLock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -196,6 +201,158 @@ class OnboardingWorkflowStore:
             "workflow": self._normalize_row(None, existing),
         }
 
+    def get_by_started_by_approval_id(
+        self,
+        approval_id: str,
+    ) -> dict[str, Any] | None:
+        """Retrieve a workflow previously started by the given approval.
+
+        Returns the durable workflow bound to ``approval_id`` or ``None``
+        when no such workflow exists. This is a read-only operation and
+        never mutates state.
+
+        When the database is unavailable the in-memory fallback is
+        consulted. The in-memory fallback is not durable across process
+        restarts; the database is the source of truth.
+        """
+        if not approval_id:
+            return None
+
+        client = self._client()
+        if client is not None:
+            try:
+                response = (
+                    client.table(TABLE_NAME)
+                    .select("*")
+                    .eq("started_by_approval_id", approval_id)
+                    .limit(1)
+                    .execute()
+                )
+                rows = response.data or []
+                if rows:
+                    return self._normalize_row(rows[0], None)
+            except Exception:  # pragma: no cover - defensive fallback
+                pass
+
+        for record in self._memory_store.values():
+            if record.get("started_by_approval_id") == approval_id:
+                return self._normalize_row(None, record)
+        return None
+
+    def get_or_create_for_approval(
+        self,
+        *,
+        approval_id: str,
+        workflow_id: str,
+        mission_id: str | None,
+        worker_id: str,
+        platform: str,
+        status: str,
+        current_step: int,
+        total_steps: int,
+        checkpoint_data: dict[str, Any] | None,
+        step_history: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Atomically return the existing workflow for an approval or create one.
+
+        Contract:
+          - Returns ``{"success": True, "workflow": <row>, "created": bool}``
+            on success. ``created=True`` indicates this call inserted;
+            ``created=False`` indicates an existing workflow was returned.
+          - When the database is available, the partial unique index
+            ``ux_onboarding_workflows_started_by_approval_id`` is the
+            final correctness authority. Concurrent calls for the same
+            ``approval_id`` will see exactly one inserted row.
+          - When the database is unavailable, the in-memory fallback uses
+            a process-local lock to avoid a TOCTOU race within a single
+            process. This fallback is NOT durable across process
+            restarts and is not a substitute for the database.
+
+        Raises no exceptions on the happy path. Database errors other
+        than a successful get-or-create degrade to the in-memory path;
+        callers that require durable state should treat the returned
+        ``created`` flag and the workflow's ``started_by_approval_id``
+        field as the canonical record.
+        """
+        if not approval_id:
+            return {"success": False, "error": "approval_id is required"}
+        if not workflow_id:
+            return {"success": False, "error": "workflow_id is required"}
+        if not worker_id:
+            return {"success": False, "error": "worker_id is required"}
+        if not platform:
+            return {"success": False, "error": "platform is required"}
+
+        safe_checkpoint = self._sanitize_json(checkpoint_data) or {}
+        safe_history = self._sanitize_json(step_history) or []
+        now = datetime.now(timezone.utc).isoformat()
+
+        client = self._client()
+        if client is not None:
+            try:
+                response = client.rpc(
+                    "claim_onboarding_workflow_for_approval",
+                    {
+                        "p_approval_id": approval_id,
+                        "p_workflow_id": workflow_id,
+                        "p_mission_id": mission_id,
+                        "p_worker_id": worker_id,
+                        "p_platform": platform,
+                        "p_status": status or "pending",
+                        "p_current_step": int(current_step),
+                        "p_total_steps": int(total_steps),
+                        "p_checkpoint_data": safe_checkpoint,
+                        "p_step_history": safe_history,
+                    },
+                ).execute()
+                data = getattr(response, "data", None) or []
+                if data:
+                    first = data[0] if isinstance(data[0], dict) else None
+                    if first:
+                        workflow_json = first.get("workflow")
+                        created = bool(first.get("created"))
+                        if workflow_json:
+                            return {
+                                "success": True,
+                                "workflow": self._normalize_row(workflow_json, None),
+                                "created": created,
+                            }
+            except Exception:  # pragma: no cover - defensive fallback
+                pass
+
+        # In-memory fallback. The lock makes the get-or-create atomic
+        # within this process. A real concurrent process can still race
+        # the in-memory path; the database is the durable authority.
+        with self._memory_lock:
+            for record in self._memory_store.values():
+                if record.get("started_by_approval_id") == approval_id:
+                    return {
+                        "success": True,
+                        "workflow": self._normalize_row(None, record),
+                        "created": False,
+                    }
+
+            new_record: dict[str, Any] = {
+                "workflow_id": workflow_id,
+                "mission_id": mission_id,
+                "worker_id": worker_id,
+                "platform": platform,
+                "status": status or "pending",
+                "current_step": int(current_step),
+                "total_steps": int(total_steps),
+                "checkpoint_data": safe_checkpoint,
+                "step_history": safe_history,
+                "started_by_approval_id": approval_id,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self._memory_store[workflow_id] = new_record
+            return {
+                "success": True,
+                "workflow": self._normalize_row(None, new_record),
+                "created": True,
+            }
+
     def list_by_worker(
         self,
         worker_id: str,
@@ -278,7 +435,7 @@ class OnboardingWorkflowStore:
     @staticmethod
     def _to_db_row(record: dict[str, Any]) -> dict[str, Any]:
         """Convert a normalized record to a Supabase row payload."""
-        return {
+        row = {
             "id": record["workflow_id"],
             "mission_id": record.get("mission_id"),
             "worker_id": record["worker_id"],
@@ -289,6 +446,10 @@ class OnboardingWorkflowStore:
             "checkpoint_data": record.get("checkpoint_data") or {},
             "step_history": record.get("step_history") or [],
         }
+        approval_id = record.get("started_by_approval_id")
+        if approval_id:
+            row["started_by_approval_id"] = approval_id
+        return row
 
     @staticmethod
     def _normalize_row(
@@ -316,6 +477,7 @@ class OnboardingWorkflowStore:
             "total_steps": source.get("total_steps"),
             "checkpoint_data": checkpoint,
             "step_history": step_history,
+            "started_by_approval_id": source.get("started_by_approval_id"),
             "created_at": source.get("created_at"),
             "updated_at": source.get("updated_at"),
         }

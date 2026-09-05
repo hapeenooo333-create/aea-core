@@ -171,6 +171,7 @@ class PinterestConnector(BaseConnector):
         self,
         worker_id: str,
         mission_id: str | None = None,
+        approval_id: str | None = None,
     ) -> dict[str, Any]:
         """Start a Pinterest onboarding workflow.
 
@@ -182,12 +183,82 @@ class PinterestConnector(BaseConnector):
             worker_id: Identifier of the worker initiating onboarding.
             mission_id: Optional identifier of the mission that triggered
                 onboarding. Persisted as-is; never invented.
+            approval_id: Optional identifier of the approval request that
+                authorized this onboarding. When supplied, the connector
+                reuses an existing durable workflow bound to this
+                approval_id if one exists. This makes ``start_onboarding``
+                restart-idempotent across process restarts, HTTP retries,
+                and duplicate approval POSTs.
 
         Returns:
             Dictionary describing workflow state with human checkpoint.
         """
-        workflow_id = str(uuid4())
         current_time = datetime.now(timezone.utc).isoformat()
+
+        # If an approval_id is supplied, atomically claim or return the
+        # existing durable workflow. The database is the source of truth;
+        # this call is safe across process restarts and concurrent resumes.
+        if approval_id:
+            candidate_workflow_id = str(uuid4())
+            checkpoint_data = {
+                "checkpoint_type": "oauth_authorization_required",
+                "instructions": (
+                    "Please authorize AEA to access your Pinterest account. "
+                    "Visit the Pinterest authorization page and complete the OAuth flow. "
+                    "Once authorized, provide the authorization code back to AEA."
+                ),
+                "metadata": {
+                    "authorization_url": "https://api.pinterest.com/oauth/",
+                    "scopes": [
+                        "user_accounts:read",
+                        "boards:read",
+                        "pins:create",
+                    ],
+                },
+            }
+            step_history = [
+                {
+                    "step": 1,
+                    "name": "OAuth Authorization",
+                    "status": "pending",
+                    "description": "Authorize AEA to access Pinterest account",
+                    "checkpoint_type": "oauth_authorization_required",
+                    "completed_at": None,
+                }
+            ]
+            claim = self._workflow_store.get_or_create_for_approval(
+                approval_id=approval_id,
+                workflow_id=candidate_workflow_id,
+                mission_id=mission_id,
+                worker_id=worker_id,
+                platform="pinterest",
+                status="awaiting_human",
+                current_step=1,
+                total_steps=3,
+                checkpoint_data=checkpoint_data,
+                step_history=step_history,
+            )
+            if claim.get("success"):
+                existing = claim["workflow"]
+                return {
+                    "success": True,
+                    "status": existing.get("status") or "awaiting_human",
+                    "workflow_id": existing.get("workflow_id"),
+                    "platform": "pinterest",
+                    "current_step": existing.get("current_step") or 1,
+                    "total_steps": existing.get("total_steps") or 3,
+                    "next_step": "oauth_authorization_required",
+                    "requires_human_intervention": True,
+                    "checkpoint_type": "oauth_authorization_required",
+                    "instructions": checkpoint_data["instructions"],
+                    "metadata": checkpoint_data["metadata"],
+                    "started_by_approval_id": existing.get("started_by_approval_id"),
+                    "reused_existing_workflow": claim.get("created") is False,
+                }
+            # If the claim call failed, fall through to the legacy path.
+
+        # Legacy / no-approval path: always create a fresh workflow.
+        workflow_id = str(uuid4())
 
         # Create the initial workflow state
         checkpoint_data = {
