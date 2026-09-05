@@ -1,20 +1,17 @@
 -- Sprint 7.2-C (P1-3): Atomic claim-or-create for an onboarding workflow
 -- tied to a specific approval_id.
 --
--- This function is the database-authoritative idempotency primitive for
--- the start_onboarding flow. It is concurrency-safe under concurrent
--- invocations because it uses SELECT ... FOR UPDATE on the candidate
--- row inside a single transaction.
+-- NOTE: This function has been hardened in
+-- sprint7_2e_claim_hardening.sql. The version installed by this
+-- migration is the original P1-3 implementation; sprint7_2e
+-- re-installs a race-free version that uses INSERT ... EXCEPTION to
+-- correctly handle the concurrent-first-creation case.
 --
--- The function is plain SECURITY INVOKER. RLS on
--- public.onboarding_workflows is enabled with permissive policies
--- (USING true / WITH CHECK true) so the invoking role (anon or
--- authenticated) is sufficient.
---
--- Returns a JSON object with two fields:
---   workflow: the row as jsonb (the existing or newly created workflow)
---   created:  boolean true if this call inserted, false if it returned
---             an existing row.
+-- The original implementation used SELECT ... FOR UPDATE followed
+-- by INSERT. That pattern is unsafe for first creation because
+-- FOR UPDATE cannot lock a row that does not yet exist. See
+-- sprint7_2e for the hardened version that the application depends
+-- on.
 --
 -- Schema-qualified names are used throughout to avoid search_path
 -- surprises.

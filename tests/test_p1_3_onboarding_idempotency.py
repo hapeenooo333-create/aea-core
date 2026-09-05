@@ -90,6 +90,34 @@ class _FakeRpcBuilder:
                 raise RuntimeError("simulated rpc failure")
             if self._name == "claim_onboarding_workflow_for_approval":
                 approval_id = self._params.get("p_approval_id")
+                if self._store.simulate_race_next_rpc:
+                    # The hardened DB function catches unique_violation
+                    # internally and returns the existing row. We mimic
+                    # that here: a concurrent insert wins the race and
+                    # we re-SELECT to return it.
+                    self._store.simulate_race_next_rpc = False
+                    existing = [
+                        r for r in self._store.rows
+                        if r.get("started_by_approval_id") == approval_id
+                    ]
+                    if not existing:
+                        # Concurrent insert wins; materialize it.
+                        existing = [{
+                            "id": "race-winner-id",
+                            "mission_id": self._params.get("p_mission_id"),
+                            "worker_id": self._params.get("p_worker_id"),
+                            "platform": self._params.get("p_platform"),
+                            "status": self._params.get("p_status"),
+                            "current_step": self._params.get("p_current_step"),
+                            "total_steps": self._params.get("p_total_steps"),
+                            "checkpoint_data": self._params.get("p_checkpoint_data"),
+                            "step_history": self._params.get("p_step_history"),
+                            "started_by_approval_id": approval_id,
+                        }]
+                        self._store.rows.extend(existing)
+                    # The losing call's INSERT would raise 23505; the
+                    # hardened function catches it and returns the row.
+                    return _FakeExec([{"workflow": existing[0], "created": False}])
                 existing = [
                     r for r in self._store.rows
                     if r.get("started_by_approval_id") == approval_id
@@ -121,6 +149,11 @@ class FakeSupabaseClient:
         self.rpc_calls: list[tuple[str, dict]] = []
         self._lock = threading.Lock()
         self.fail_next_rpc: bool = False
+        # When set, the next claim RPC call returns the existing row
+        # (created=False) even if no row exists yet, simulating the
+        # hardened DB function's behavior of catching unique_violation
+        # when a concurrent insert wins the race.
+        self.simulate_race_next_rpc: bool = False
 
     def table(self, name: str):
         return _FakeWorkflowTable(self)
@@ -440,6 +473,144 @@ def test_concurrent_start_with_same_approval_creates_at_most_one_workflow_in_mem
     assert len(workflow_ids) == 1, f"expected one workflow, got {workflow_ids}"
     # The fake RPC serialized; the row count reflects that.
     assert len(client.rows) == 1
+
+
+def test_concurrent_first_creation_race_returns_same_workflow_to_both_callers():
+    """Hardening: two callers with the same approval_id and no pre-existing
+    row must BOTH return successfully with the SAME workflow_id.
+
+    The DB function (claim_onboarding_workflow_for_approval) wraps the
+    INSERT in an EXCEPTION WHEN unique_violation block so the loser of
+    the race catches the partial-unique-index violation and returns the
+    winner's row. The losing call must NOT propagate 23505 to the
+    application. This test simulates the race by using a fake RPC
+    builder that mimics the hardened function's behavior.
+    """
+    import concurrent.futures
+
+    client = FakeSupabaseClient()
+    store = OnboardingWorkflowStore(client=client)
+    approval_id = str(uuid4())
+
+    # Simulate the race: the first RPC call inserts; the second sees
+    # the unique_violation and returns the existing row. The hardened
+    # DB function does this internally; the fake replicates it.
+    call_count = {"n": 0}
+    real_rpc = client.rpc
+
+    def racing_rpc(name, params):
+        builder = real_rpc(name, params)
+        original_execute = builder.execute
+
+        def execute():
+            with client._lock:
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    # Direct path: original_execute re-acquires the
+                    # same lock, so we inline the logic here to avoid
+                    # a deadlock with the non-reentrant Lock.
+                    if client.fail_next_rpc:
+                        client.fail_next_rpc = False
+                        raise RuntimeError("simulated rpc failure")
+                    approval_id = params.get("p_approval_id")
+                    matched = [
+                        r for r in client.rows
+                        if r.get("started_by_approval_id") == approval_id
+                    ]
+                    if matched:
+                        return _FakeExec([{"workflow": matched[0], "created": False}])
+                    new_row = {
+                        "id": params.get("p_workflow_id"),
+                        "mission_id": params.get("p_mission_id"),
+                        "worker_id": params.get("p_worker_id"),
+                        "platform": params.get("p_platform"),
+                        "status": params.get("p_status"),
+                        "current_step": params.get("p_current_step"),
+                        "total_steps": params.get("p_total_steps"),
+                        "checkpoint_data": params.get("p_checkpoint_data"),
+                        "step_history": params.get("p_step_history"),
+                        "started_by_approval_id": approval_id,
+                    }
+                    client.rows.append(new_row)
+                    return _FakeExec([{"workflow": new_row, "created": True}])
+                # Second concurrent call: a row already exists. The
+                # hardened function catches 23505 and returns it. The
+                # fake honors that contract.
+                approval_id = params.get("p_approval_id")
+                matched = [
+                    r for r in client.rows
+                    if r.get("started_by_approval_id") == approval_id
+                ]
+                if matched:
+                    return _FakeExec([{"workflow": matched[0], "created": False}])
+                return _FakeExec([])
+
+        builder.execute = execute
+        return builder
+
+    client.rpc = racing_rpc
+
+    def call():
+        return store.get_or_create_for_approval(
+            approval_id=approval_id,
+            workflow_id=str(uuid4()),
+            mission_id="m-1",
+            worker_id="w-1",
+            platform="pinterest",
+            status="awaiting_human",
+            current_step=1,
+            total_steps=3,
+            checkpoint_data={},
+            step_history=[],
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        results = list(ex.map(lambda _: call(), range(2)))
+
+    # Both calls succeed.
+    assert all(r["success"] is True for r in results)
+    # Both calls return the same workflow_id.
+    workflow_ids = {r["workflow"]["workflow_id"] for r in results}
+    assert len(workflow_ids) == 1, (
+        f"Two concurrent first-creation calls returned different "
+        f"workflow_ids: {workflow_ids}"
+    )
+    # Exactly one row in the DB; no 23505 surfaced.
+    assert len(client.rows) == 1
+    # The created flag is True for the winner and False for the loser.
+    created_flags = {r["created"] for r in results}
+    assert created_flags == {True, False}, (
+        f"Expected one True and one False created flag, got {created_flags}"
+    )
+
+
+def test_concurrent_first_creation_race_surfaces_23505_to_legacy_fallback_only():
+    """Defense-in-depth: if the DB function ever raised 23505 (it should
+    not, post-hardening), the Python store must catch it and degrade
+    to the in-memory fallback without crashing. This test verifies the
+    store's try/except covers that case."""
+    client = FakeSupabaseClient()
+    # Force the RPC to raise the kind of exception a non-hardened
+    # function would produce under contention.
+    client.fail_next_rpc = True
+    store = OnboardingWorkflowStore(client=client)
+
+    result = store.get_or_create_for_approval(
+        approval_id=str(uuid4()),
+        workflow_id=str(uuid4()),
+        mission_id="m-1",
+        worker_id="w-1",
+        platform="pinterest",
+        status="awaiting_human",
+        current_step=1,
+        total_steps=3,
+        checkpoint_data={},
+        step_history=[],
+    )
+    assert result["success"] is True
+    assert result["created"] is True
+    # The fallback was used; no exception propagated.
+    assert result["workflow"]["workflow_id"] is not None
 
 
 # ---------------------------------------------------------------------------
