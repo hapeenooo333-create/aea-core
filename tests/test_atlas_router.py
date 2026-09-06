@@ -10,6 +10,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import app.main as main_module
 import app.routers.atlas as atlas_module
+from app.dependencies import get_current_user_id, get_user_scoped_client, get_current_user
+from fastapi import FastAPI
+
+atlas_test_app = FastAPI()
+atlas_test_app.include_router(atlas_module.router)
+
+
+def _override_get_current_user_id():
+    return "test-user"
+
+
+def _override_get_current_user():
+    return {"id": "test-user", "email": "test@example.com", "role": "authenticated"}
+
+
+def _override_get_user_scoped_client():
+    return atlas_module.database_module.supabase_client
+
+
+atlas_test_app.dependency_overrides[get_current_user_id] = _override_get_current_user_id
+atlas_test_app.dependency_overrides[get_current_user] = _override_get_current_user
+atlas_test_app.dependency_overrides[get_user_scoped_client] = _override_get_user_scoped_client
 
 
 class FakeResponse:
@@ -27,6 +49,7 @@ class FakeTable:
         self._order_desc = False
         self._filter_column: str | None = None
         self._filter_value: str | None = None
+        self._limit: int | None = None
 
     def select(self, *_args, **_kwargs):
         self._method = "select"
@@ -52,6 +75,10 @@ class FakeTable:
         self._order_desc = desc
         return self
 
+    def limit(self, count: int):
+        self._limit = count
+        return self
+
     def execute(self):
         if self._method == "insert":
             row = dict(self._payload or {})
@@ -73,8 +100,16 @@ class FakeTable:
             return FakeResponse(rows)
 
         rows = [dict(item) for item in self.client.data[self.table_name]]
+        if self._filter_column is not None:
+            rows = [
+                row
+                for row in rows
+                if str(row.get(self._filter_column or "")) == str(self._filter_value or "")
+            ]
         if self._order_column:
             rows.sort(key=lambda item: item.get(self._order_column, ""), reverse=self._order_desc)
+        if self._limit is not None:
+            rows = rows[: self._limit]
         return FakeResponse(rows)
 
 
@@ -95,7 +130,7 @@ def test_atlas_mission_flow(monkeypatch):
     fake_client = FakeSupabaseClient()
     monkeypatch.setattr(atlas_module.database_module, "supabase_client", fake_client)
 
-    with TestClient(main_module.app) as client:
+    with TestClient(atlas_test_app) as client:
         response = client.post(
             "/atlas/mission",
             json={
@@ -104,6 +139,7 @@ def test_atlas_mission_flow(monkeypatch):
                 "assigned_worker": "worker-1",
                 "priority": "high",
             },
+            headers={"Authorization": "Bearer test-token"},
         )
 
         assert response.status_code == 200, response.text
@@ -112,18 +148,19 @@ def test_atlas_mission_flow(monkeypatch):
         assert body["title"] == "Growth campaign"
         assert body["priority"] == "high"
 
-        missions_response = client.get("/atlas/missions")
+        missions_response = client.get("/atlas/missions", headers={"Authorization": "Bearer test-token"})
         assert missions_response.status_code == 200, missions_response.text
         assert len(missions_response.json()) == 1
 
         mission_id = body["id"]
-        detail_response = client.get(f"/atlas/missions/{mission_id}")
+        detail_response = client.get(f"/atlas/missions/{mission_id}", headers={"Authorization": "Bearer test-token"})
         assert detail_response.status_code == 200, detail_response.text
         assert detail_response.json()["title"] == "Growth campaign"
 
         patch_response = client.patch(
             f"/atlas/missions/{mission_id}",
             json={"status": "in_progress", "progress": 25, "result": {"note": "started"}},
+            headers={"Authorization": "Bearer test-token"},
         )
         assert patch_response.status_code == 200, patch_response.text
         patched = patch_response.json()
