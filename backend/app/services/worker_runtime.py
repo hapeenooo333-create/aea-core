@@ -15,11 +15,12 @@ from typing import Any
 
 from .action_engine import ActionEngine
 from .approval_gateway import ApprovalGateway
-from .connectors.registry import ConnectorRegistry
 from .decision_engine import AtlasDecisionEngine
+from .employee_engine import EmployeeEngine
 from .human_intervention import HumanInterventionManager
 from .memory_engine import AtlasMemoryEngine
 from .mission_engine import MissionEngine
+from .connectors.registry import ConnectorRegistry
 
 
 class WorkerRuntime:
@@ -43,9 +44,13 @@ class WorkerRuntime:
         self._approval_gateway = ApprovalGateway()
         self._connector_registry = connector_registry
         self._human_intervention_manager = HumanInterventionManager()
+        self._employee_engine = EmployeeEngine(
+            connector_registry=connector_registry,
+            owner_id=owner_id,
+        )
 
     def execute_mission(self, mission_id: str) -> dict[str, Any]:
-        """Execute a mission through the lightweight runtime workflow.
+        """Execute a mission through the employee loop workflow.
 
         Args:
             mission_id: The unique mission identifier to execute.
@@ -62,45 +67,12 @@ class WorkerRuntime:
         if not worker_id:
             return {"success": False, "error": "Mission has no assigned worker"}
 
-        recent_memories = self._memory_engine.get_recent_memories(worker_id, limit=5)
-        decision = self._decision_engine.next_action()
-
         try:
             self._mission_engine.update_status(mission_id, "active")
         except Exception:  # pragma: no cover - defensive runtime handling
             pass
 
-        action_result = self._execute_placeholder_action(mission, recent_memories, decision)
-
-        memory_payload = {
-            "mission_id": mission_id,
-            "worker_id": worker_id,
-            "action": action_result.get("action"),
-            "decision": decision,
-            "result": action_result.get("result"),
-        }
-        self._memory_engine.store_memory(worker_id, "task_result", memory_payload, owner_id=self._owner_id)
-
-        if action_result.get("success"):
-            self._mission_engine.complete_mission(mission_id, action_result.get("result", {}))
-            return {
-                "success": True,
-                "mission_id": mission_id,
-                "worker_id": worker_id,
-                "decision": decision,
-                "action": action_result.get("action"),
-                "result": action_result.get("result"),
-            }
-
-        self._mission_engine.fail_mission(mission_id, action_result.get("error", "Mission execution failed"))
-        return {
-            "success": False,
-            "mission_id": mission_id,
-            "worker_id": worker_id,
-            "decision": decision,
-            "action": action_result.get("action"),
-            "error": action_result.get("error"),
-        }
+        return self._employee_engine.run_mission(mission_id)
 
     def execute_action_with_approval(
         self,
@@ -426,31 +398,6 @@ class WorkerRuntime:
             "mission_count": len(missions),
             "missions": missions,
             "memories": memories,
-        }
-
-    def _execute_placeholder_action(
-        self,
-        mission: dict[str, Any],
-        recent_memories: list[dict[str, Any]],
-        decision: str,
-    ) -> dict[str, Any]:
-        """Execute a placeholder action for the mission.
-
-        The method intentionally stays simple and deterministic so it can be
-        used safely in tests and non-configured environments.
-        """
-
-        title = mission.get("title") or "Untitled mission"
-        description = mission.get("description") or ""
-        return {
-            "success": True,
-            "action": f"{decision}: {title}",
-            "result": {
-                "title": title,
-                "description": description,
-                "decision": decision,
-                "memory_count": len(recent_memories),
-            },
         }
 
 

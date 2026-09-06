@@ -22,6 +22,8 @@ SAFE_ACTIONS = {
     "log",
     "check_platform_status",
     "health_check",
+    "test_echo",
+    "test_count",
 }
 
 SENSITIVE_ACTIONS = {
@@ -141,6 +143,10 @@ class ActionEngine:
                 return self._handle_check_platform_status(payload)
             if action_type == "health_check":
                 return self._handle_health_check(payload)
+            if action_type == "test_echo":
+                return self._handle_test_echo(payload)
+            if action_type == "test_count":
+                return self._handle_test_count(payload)
             if action_type == "start_platform_onboarding":
                 return self._handle_start_platform_onboarding(payload)
             if action_type == "resume_platform_onboarding":
@@ -269,6 +275,46 @@ class ActionEngine:
             "result": {
                 "message": "Health check executed",
                 "status": "healthy",
+            },
+        }
+
+    def _handle_test_echo(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Handle a test echo action.
+
+        Echoes the provided message with metadata for testing.
+        """
+        message = payload.get("message") if isinstance(payload, dict) else None
+        echo_result = {
+            "echoed_message": message or "No message provided",
+            "timestamp": payload.get("timestamp", "now"),
+        }
+        return {
+            "success": True,
+            "action": "test_echo",
+            "result": echo_result,
+        }
+
+    def _handle_test_count(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Handle a test count action.
+
+        Counts from 1 to the specified number.
+        """
+        count = payload.get("count", 0) if isinstance(payload, dict) else 0
+        try:
+            count_int = int(count)
+            if count_int < 0:
+                count_int = 0
+        except (ValueError, TypeError):
+            count_int = 0
+
+        sequence = list(range(1, count_int + 1))
+        return {
+            "success": True,
+            "action": "test_count",
+            "result": {
+                "count": count_int,
+                "sequence": sequence,
+                "sum": sum(sequence),
             },
         }
 
