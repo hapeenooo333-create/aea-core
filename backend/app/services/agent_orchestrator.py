@@ -21,15 +21,15 @@ from .worker_runtime import WorkerRuntime
 class AgentOrchestrator:
     """Coordinate the autonomous agent workflow across lightweight services."""
 
-    def __init__(self) -> None:
+    def __init__(self, owner_id: str | None = None) -> None:
         """Initialize the orchestrator and its supporting services."""
 
         self._mission_engine = MissionEngine()
-        self._worker_runtime = WorkerRuntime()
-        self._decision_engine = AtlasDecisionEngine()
-        self._action_engine = ActionEngine()
+        self._worker_runtime = WorkerRuntime(owner_id=owner_id)
+        self._decision_engine = AtlasDecisionEngine(owner_id=owner_id)
+        self._action_engine = ActionEngine(owner_id=owner_id)
         self._tool_registry = ToolRegistry()
-        self._memory_engine = AtlasMemoryEngine()
+        self._memory_engine = AtlasMemoryEngine(owner_id=owner_id)
         self._wire_shared_services()
 
     def run_mission(self, mission_id: str) -> dict[str, Any]:

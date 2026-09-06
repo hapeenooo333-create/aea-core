@@ -46,9 +46,15 @@ CONNECTOR_ACTIONS = {
 class ActionEngine:
     """Translate action requests into lightweight execution results."""
 
-    def __init__(self) -> None:
-        """Initialize the engine with its supporting services."""
+    def __init__(self, owner_id: str | None = None) -> None:
+        """Initialize the engine with its supporting services.
 
+        Args:
+            owner_id: Canonical owner identifier (auth.users.id). When provided,
+                memory operations will be scoped to this owner for RLS enforcement.
+        """
+
+        self._owner_id = owner_id
         self._memory_engine = AtlasMemoryEngine()
 
     def classify_action(self, action_type: str) -> dict[str, Any]:
@@ -165,7 +171,7 @@ class ActionEngine:
         if not worker_id:
             return {"success": False, "error": "worker_id is required for memory storage"}
 
-        response = self._memory_engine.store_memory(worker_id, memory_type, content)
+        response = self._memory_engine.store_memory(worker_id, memory_type, content, owner_id=self._owner_id)
         if response.get("success"):
             return {"success": True, "action": "memory_store", "result": response}
 

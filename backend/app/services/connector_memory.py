@@ -17,14 +17,17 @@ from .memory_engine import AtlasMemoryEngine
 class ConnectorMemoryRecorder:
     """Record connector-related events in agent memory."""
 
-    def __init__(self, memory_engine: AtlasMemoryEngine | None = None) -> None:
+    def __init__(self, memory_engine: AtlasMemoryEngine | None = None, owner_id: str | None = None) -> None:
         """Initialize the recorder.
 
         Args:
             memory_engine: Optional AtlasMemoryEngine instance.
                           If not provided, a new one will be created.
+            owner_id: Canonical owner identifier (auth.users.id). When provided,
+                memory operations will be scoped to this owner for RLS enforcement.
         """
         self._memory_engine = memory_engine or AtlasMemoryEngine()
+        self._owner_id = owner_id
 
     def record_onboarding_started(
         self,
@@ -47,7 +50,7 @@ class ConnectorMemoryRecorder:
             "platform": platform,
             "mission_id": mission_id,
         }
-        return self._memory_engine.store_memory(worker_id, "platform_onboarding", content)
+        return self._memory_engine.store_memory(worker_id, "platform_onboarding", content, owner_id=self._owner_id)
 
     def record_onboarding_paused(
         self,
@@ -76,7 +79,7 @@ class ConnectorMemoryRecorder:
             "workflow_id": workflow_id,
             "mission_id": mission_id,
         }
-        return self._memory_engine.store_memory(worker_id, "platform_onboarding", content)
+        return self._memory_engine.store_memory(worker_id, "platform_onboarding", content, owner_id=self._owner_id)
 
     def record_checkpoint_completed(
         self,
@@ -105,7 +108,7 @@ class ConnectorMemoryRecorder:
             "workflow_id": workflow_id,
             "mission_id": mission_id,
         }
-        return self._memory_engine.store_memory(worker_id, "platform_onboarding", content)
+        return self._memory_engine.store_memory(worker_id, "platform_onboarding", content, owner_id=self._owner_id)
 
     def record_onboarding_completed(
         self,
@@ -131,7 +134,7 @@ class ConnectorMemoryRecorder:
             "workflow_id": workflow_id,
             "mission_id": mission_id,
         }
-        return self._memory_engine.store_memory(worker_id, "platform_onboarding", content)
+        return self._memory_engine.store_memory(worker_id, "platform_onboarding", content, owner_id=self._owner_id)
 
     def record_platform_connected(
         self,
@@ -157,7 +160,7 @@ class ConnectorMemoryRecorder:
             "external_account_id": external_account_id,
             "display_name": display_name,
         }
-        return self._memory_engine.store_memory(worker_id, "platform_connection", content)
+        return self._memory_engine.store_memory(worker_id, "platform_connection", content, owner_id=self._owner_id)
 
     def record_connector_error(
         self,
@@ -186,7 +189,7 @@ class ConnectorMemoryRecorder:
             "action_type": action_type,
             "workflow_id": workflow_id,
         }
-        return self._memory_engine.store_memory(worker_id, "connector_event", content)
+        return self._memory_engine.store_memory(worker_id, "connector_event", content, owner_id=self._owner_id)
 
     def record_action_dispatched(
         self,
@@ -212,4 +215,4 @@ class ConnectorMemoryRecorder:
             "action_type": action_type,
             "mission_id": mission_id,
         }
-        return self._memory_engine.store_memory(worker_id, "connector_event", content)
+        return self._memory_engine.store_memory(worker_id, "connector_event", content, owner_id=self._owner_id)

@@ -17,8 +17,8 @@ class FakeMemoryEngine:
     def get_recent_memories(self, worker_id: str, limit: int = 5):
         return list(self.memories)
 
-    def store_memory(self, worker_id: str, memory_type: str, content: dict):
-        self.stored.append({"worker_id": worker_id, "memory_type": memory_type, "content": content})
+    def store_memory(self, worker_id: str, memory_type: str, content: dict, owner_id: str | None = None):
+        self.stored.append({"worker_id": worker_id, "memory_type": memory_type, "content": content, "owner_id": owner_id})
         return {"success": True}
 
 

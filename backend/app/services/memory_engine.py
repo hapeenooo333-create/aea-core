@@ -25,18 +25,26 @@ class AtlasMemoryEngine:
     consistently.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, client: Any | None = None, owner_id: str | None = None) -> None:
         """Initialize the memory engine with the shared Supabase client."""
 
-        self._client = supabase_client
+        self._client = client if client is not None else supabase_client
+        self._owner_id = owner_id
 
-    def store_memory(self, worker_id: str, memory_type: str, content: dict[str, Any]) -> dict[str, Any]:
+    def store_memory(
+        self,
+        worker_id: str,
+        memory_type: str,
+        content: dict[str, Any],
+        owner_id: str | None = None,
+    ) -> dict[str, Any]:
         """Store a memory entry for a worker."""
 
         if not self._client:
             return {"success": False, "error": "Supabase client is not available"}
 
-        payload = self._to_storage_record(worker_id, memory_type, content)
+        effective_owner_id = owner_id if owner_id is not None else self._owner_id
+        payload = self._to_storage_record(worker_id, memory_type, content, owner_id=effective_owner_id)
 
         try:
             response = self._client.table("agent_memory_entries").insert(payload).execute()
@@ -45,15 +53,16 @@ class AtlasMemoryEngine:
         except Exception as exc:  # pragma: no cover - defensive runtime handling
             return {"success": False, "error": str(exc)}
 
-    def get_recent_memories(self, worker_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    def get_recent_memories(self, worker_id: str, limit: int = 10, client: Any | None = None) -> list[dict[str, Any]]:
         """Retrieve the most recent memory entries for a worker."""
 
-        if not self._client:
+        db_client = client if client is not None else self._client
+        if not db_client:
             return []
 
         try:
             response = (
-                self._client.table("agent_memory_entries")
+                db_client.table("agent_memory_entries")
                 .select("*")
                 .eq("worker_id", worker_id)
                 .order("created_at", desc=True)
@@ -65,14 +74,15 @@ class AtlasMemoryEngine:
         except Exception:  # pragma: no cover - defensive runtime handling
             return []
 
-    def search_memories(self, keyword: str) -> list[dict[str, Any]]:
+    def search_memories(self, keyword: str, client: Any | None = None) -> list[dict[str, Any]]:
         """Search memory entries by keyword."""
 
-        if not self._client:
+        db_client = client if client is not None else self._client
+        if not db_client:
             return []
 
         try:
-            response = self._client.table("agent_memory_entries").select("*").execute()
+            response = db_client.table("agent_memory_entries").select("*").execute()
             rows = response.data or []
         except Exception:  # pragma: no cover - defensive runtime handling
             return []
@@ -96,19 +106,26 @@ class AtlasMemoryEngine:
 
         return matched_rows
 
-    def delete_memory(self, memory_id: str) -> dict[str, Any]:
+    def delete_memory(self, memory_id: str, client: Any | None = None) -> dict[str, Any]:
         """Delete a memory entry by identifier."""
 
-        if not self._client:
+        db_client = client if client is not None else self._client
+        if not db_client:
             return {"success": False, "memory_id": memory_id, "error": "Supabase client is not available"}
 
         try:
-            response = self._client.table("agent_memory_entries").delete().eq("id", memory_id).execute()
+            response = db_client.table("agent_memory_entries").delete().eq("id", memory_id).execute()
             return {"success": True, "memory_id": memory_id, "deleted": bool(response.data)}
         except Exception as exc:  # pragma: no cover - defensive runtime handling
             return {"success": False, "memory_id": memory_id, "error": str(exc)}
 
-    def _to_storage_record(self, worker_id: str, memory_type: str, content: dict[str, Any] | None) -> dict[str, Any]:
+    def _to_storage_record(
+        self,
+        worker_id: str,
+        memory_type: str,
+        content: dict[str, Any] | None,
+        owner_id: str | None = None,
+    ) -> dict[str, Any]:
         """Convert a public memory payload into a storage-ready adapter payload."""
 
         normalized_content = content if isinstance(content, dict) else {}
@@ -122,7 +139,7 @@ class AtlasMemoryEngine:
         except (TypeError, ValueError):
             importance_score = 0.5
 
-        return {
+        record: dict[str, Any] = {
             "worker_id": worker_id,
             "mission_id": normalized_content.get("mission_id"),
             "memory_type": memory_type,
@@ -130,6 +147,9 @@ class AtlasMemoryEngine:
             "metadata": metadata,
             "importance_score": importance_score,
         }
+        if owner_id:
+            record["owner_id"] = owner_id
+        return record
 
     def _from_storage_record(self, row: dict[str, Any] | None) -> dict[str, Any] | None:
         """Normalize a Supabase row into a backward-compatible dictionary shape."""

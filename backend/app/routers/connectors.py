@@ -8,19 +8,23 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 
+from app.dependencies import get_current_user_id
 from app.services.connectors.pinterest_connector import PinterestConnector
 from app.services.connectors.registry import ConnectorRegistry
 from app.services.human_intervention import HumanInterventionManager
 from app.services.worker_runtime import WorkerRuntime
 
-router = APIRouter(prefix="/connectors", tags=["connectors"])
+router = APIRouter(
+    prefix="/connectors",
+    tags=["connectors"],
+    dependencies=[Depends(get_current_user_id)],
+)
 
 # Initialize services
 _connector_registry: ConnectorRegistry | None = None
-_worker_runtime: WorkerRuntime | None = None
 _human_intervention_manager: HumanInterventionManager | None = None
 
 
@@ -35,13 +39,10 @@ def get_connector_registry() -> ConnectorRegistry:
     return _connector_registry
 
 
-def get_worker_runtime() -> WorkerRuntime:
-    """Get or initialize the worker runtime."""
-    global _worker_runtime
-    if _worker_runtime is None:
-        registry = get_connector_registry()
-        _worker_runtime = WorkerRuntime(connector_registry=registry)
-    return _worker_runtime
+def get_worker_runtime(current_user_id: str = Depends(get_current_user_id)) -> WorkerRuntime:
+    """Get or initialize the worker runtime scoped to the current user."""
+    registry = get_connector_registry()
+    return WorkerRuntime(connector_registry=registry, owner_id=current_user_id)
 
 
 def get_human_intervention_manager() -> HumanInterventionManager:

@@ -4,16 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict
 
 from app import database as database_module
+from app.dependencies import get_current_user_id, get_user_scoped_client
 from app.services.agent_orchestrator import AgentOrchestrator
 from app.services.worker_runtime import WorkerRuntime
 
 router = APIRouter(prefix="/workers", tags=["workers"])
-worker_runtime = WorkerRuntime()
-orchestrator = AgentOrchestrator()
 
 
 class WorkerCreateRequest(BaseModel):
@@ -44,15 +43,18 @@ MOCK_WORKERS = [
 
 
 @router.get("")
-async def list_workers() -> list[dict[str, Any]]:
-    """Return all workers or mock data if Supabase is unavailable."""
+async def list_workers(
+    request: Request,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> list[dict[str, Any]]:
+    """Return workers owned by the current user."""
 
-    client = database_module.supabase_client
     if not client:
         return MOCK_WORKERS
 
     try:
-        response = client.table("workers").select("*").execute()
+        response = client.table("workers").select("*").eq("owner_id", current_user_id).execute()
         rows = response.data or []
         return [dict(row) for row in rows]
     except Exception:  # pragma: no cover - defensive error path
@@ -60,21 +62,23 @@ async def list_workers() -> list[dict[str, Any]]:
 
 
 @router.post("")
-async def create_worker(request: WorkerCreateRequest) -> dict[str, Any]:
-    """Create a new worker."""
+async def create_worker(
+    request: Request,
+    body: WorkerCreateRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
+    """Create a new worker owned by the current user."""
 
-    # Import here to allow test monkeypatching
-    from app import main as main_module
-
-    client = getattr(main_module, "supabase_client", None)
     if not client:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Supabase client unavailable")
 
     try:
         payload = {
-            "name": request.name,
-            "role": request.role or "assistant",
-            "status": request.status or "active",
+            "name": body.name,
+            "role": body.role or "assistant",
+            "status": body.status or "active",
+            "owner_id": current_user_id,
         }
         response = client.table("workers").insert(payload).execute()
         record = response.data[0] if response.data else None
@@ -84,17 +88,19 @@ async def create_worker(request: WorkerCreateRequest) -> dict[str, Any]:
 
 
 @router.get("/{worker_id}/status")
-async def get_worker_status(worker_id: str) -> dict[str, Any]:
-    """Return the runtime state for a worker."""
+async def get_worker_status(worker_id: str, current_user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
+    """Return the runtime state for a worker owned by the current user."""
 
+    worker_runtime = WorkerRuntime(owner_id=current_user_id)
     state = worker_runtime.get_worker_state(worker_id)
     return state
 
 
 @router.post("/{worker_id}/run")
-async def run_worker(worker_id: str) -> dict[str, Any]:
+async def run_worker(worker_id: str, current_user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
     """Execute all pending missions for a worker."""
 
+    orchestrator = AgentOrchestrator(owner_id=current_user_id)
     result = orchestrator.run_worker(worker_id)
     if not result.get("success"):
         error = result.get("error") or "Worker execution failed"

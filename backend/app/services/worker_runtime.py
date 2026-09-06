@@ -25,18 +25,21 @@ from .mission_engine import MissionEngine
 class WorkerRuntime:
     """Coordinate mission execution with the existing lightweight services."""
 
-    def __init__(self, connector_registry: ConnectorRegistry | None = None) -> None:
+    def __init__(self, connector_registry: ConnectorRegistry | None = None, owner_id: str | None = None) -> None:
         """Initialize the runtime with its supporting engines.
 
         Args:
             connector_registry: Optional ConnectorRegistry for platform operations.
                               If not provided, platform actions will not be executed.
+            owner_id: Canonical owner identifier (auth.users.id). When provided,
+                memory operations will be scoped to this owner for RLS enforcement.
         """
 
+        self._owner_id = owner_id
         self._mission_engine = MissionEngine()
         self._memory_engine = AtlasMemoryEngine()
-        self._decision_engine = AtlasDecisionEngine()
-        self._action_engine = ActionEngine()
+        self._decision_engine = AtlasDecisionEngine(owner_id=owner_id)
+        self._action_engine = ActionEngine(owner_id=owner_id)
         self._approval_gateway = ApprovalGateway()
         self._connector_registry = connector_registry
         self._human_intervention_manager = HumanInterventionManager()
@@ -76,7 +79,7 @@ class WorkerRuntime:
             "decision": decision,
             "result": action_result.get("result"),
         }
-        self._memory_engine.store_memory(worker_id, "task_result", memory_payload)
+        self._memory_engine.store_memory(worker_id, "task_result", memory_payload, owner_id=self._owner_id)
 
         if action_result.get("success"):
             self._mission_engine.complete_mission(mission_id, action_result.get("result", {}))

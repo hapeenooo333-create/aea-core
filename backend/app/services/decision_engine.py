@@ -24,11 +24,24 @@ class AtlasDecisionEngine:
     to take.
     """
 
-    def __init__(self, provider: BaseLLMProvider | None = None, memory_engine: AtlasMemoryEngine | None = None) -> None:
-        """Initialize the engine with the built-in worker routing rules."""
+    def __init__(
+        self,
+        provider: BaseLLMProvider | None = None,
+        memory_engine: AtlasMemoryEngine | None = None,
+        owner_id: str | None = None,
+    ) -> None:
+        """Initialize the engine with the built-in worker routing rules.
+
+        Args:
+            provider: Optional LLM provider for decision generation.
+            memory_engine: Optional AtlasMemoryEngine instance.
+            owner_id: Canonical owner identifier (auth.users.id). When provided,
+                memory operations will be scoped to this owner for RLS enforcement.
+        """
 
         self._provider = provider or get_llm_provider()
         self._memory_engine = memory_engine or AtlasMemoryEngine()
+        self._owner_id = owner_id
         self._memory_context_limit = int(os.getenv("MEMORY_CONTEXT_LIMIT", "5") or "5")
         self._worker_rules: dict[str, str] = {
             "pinterest": "Pinterest Worker",
@@ -224,7 +237,7 @@ class AtlasDecisionEngine:
                 "decision": decision.get("content") or decision.get("action"),
                 "timestamp": decision.get("timestamp") or "now",
             }
-            self._memory_engine.store_memory(worker_id, "decision", content)
+            self._memory_engine.store_memory(worker_id, "decision", content, owner_id=self._owner_id)
         except Exception:  # pragma: no cover - defensive runtime handling
             pass
 
