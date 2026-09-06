@@ -22,10 +22,10 @@ except Exception:  # pragma: no cover - fallback for missing runtime config
 class MissionEngine:
     """Persist and query mission records with the shared Supabase client."""
 
-    def __init__(self) -> None:
+    def __init__(self, client: Any | None = None) -> None:
         """Initialize the engine with the shared Supabase client."""
 
-        self._client = self._get_client()
+        self._client = client if client is not None else self._get_client()
 
     def create_mission(
         self,
@@ -33,6 +33,8 @@ class MissionEngine:
         description: str,
         worker_id: str | None = None,
         priority: str = "normal",
+        owner_id: str | None = None,
+        client: Any | None = None,
     ) -> dict[str, Any]:
         """Create a new mission record.
 
@@ -41,6 +43,8 @@ class MissionEngine:
             description: A descriptive mission summary.
             worker_id: An optional worker identifier to assign to the mission.
             priority: A textual priority such as ``high`` or ``normal``.
+            owner_id: Canonical owner identifier (auth.users.id).
+            client: Optional Supabase client. When ``None``, uses the shared client.
 
         Returns:
             A structured dictionary describing the operation result.
@@ -49,7 +53,8 @@ class MissionEngine:
         if not title.strip():
             return {"success": False, "error": "Mission title is required"}
 
-        if not self._client:
+        db_client = client if client is not None else self._client
+        if not db_client:
             return {"success": False, "error": "Supabase client is not available"}
 
         payload: dict[str, Any] = {
@@ -62,6 +67,9 @@ class MissionEngine:
         if worker_id:
             payload["assigned_worker"] = worker_id
 
+        if owner_id:
+            payload["owner_id"] = owner_id
+
         try:
             response = self._client.table("missions").insert(payload).execute()
             record = self._normalize_mission(response.data[0]) if response.data else None
@@ -69,21 +77,23 @@ class MissionEngine:
         except Exception as exc:  # pragma: no cover - defensive runtime handling
             return {"success": False, "error": str(exc)}
 
-    def get_mission(self, mission_id: str) -> dict[str, Any] | None:
+    def get_mission(self, mission_id: str, client: Any | None = None) -> dict[str, Any] | None:
         """Retrieve a single mission by identifier.
 
         Args:
             mission_id: The unique mission identifier.
+            client: Optional Supabase client. When ``None``, uses the shared client.
 
         Returns:
             A normalized mission dictionary when found, otherwise ``None``.
         """
 
-        if not self._client:
+        db_client = client if client is not None else self._client
+        if not db_client:
             return None
 
         try:
-            response = self._client.table("missions").select("*").eq("id", mission_id).limit(1).execute()
+            response = db_client.table("missions").select("*").eq("id", mission_id).limit(1).execute()
             rows = response.data or []
             if not rows:
                 return None
@@ -91,24 +101,26 @@ class MissionEngine:
         except Exception:  # pragma: no cover - defensive runtime handling
             return None
 
-    def get_worker_missions(self, worker_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    def get_worker_missions(self, worker_id: str, limit: int = 20, client: Any | None = None) -> list[dict[str, Any]]:
         """List missions assigned to a worker.
 
         Args:
             worker_id: The worker identifier whose missions should be returned.
             limit: The maximum number of missions to retrieve.
+            client: Optional Supabase client. When ``None``, uses the shared client.
 
         Returns:
             A list of normalized mission dictionaries ordered from newest to
             oldest.
         """
 
-        if not self._client:
+        db_client = client if client is not None else self._client
+        if not db_client:
             return []
 
         try:
             response = (
-                self._client.table("missions")
+                db_client.table("missions")
                 .select("*")
                 .eq("assigned_worker", worker_id)
                 .order("created_at", desc=True)
@@ -120,12 +132,13 @@ class MissionEngine:
         except Exception:  # pragma: no cover - defensive runtime handling
             return []
 
-    def update_status(self, mission_id: str, status: str) -> dict[str, Any]:
+    def update_status(self, mission_id: str, status: str, client: Any | None = None) -> dict[str, Any]:
         """Update the lifecycle status of a mission.
 
         Args:
             mission_id: The unique mission identifier.
             status: The next lifecycle status.
+            client: Optional Supabase client. When ``None``, uses the shared client.
 
         Returns:
             A structured dictionary describing the operation result.
@@ -135,28 +148,31 @@ class MissionEngine:
         if status not in allowed_statuses:
             return {"success": False, "error": f"Unsupported status: {status}"}
 
-        if not self._client:
+        db_client = client if client is not None else self._client
+        if not db_client:
             return {"success": False, "error": "Supabase client is not available"}
 
         try:
-            response = self._client.table("missions").update({"status": status}).eq("id", mission_id).execute()
+            response = db_client.table("missions").update({"status": status}).eq("id", mission_id).execute()
             record = self._normalize_mission(response.data[0]) if response.data else None
             return {"success": True, "mission": record}
         except Exception as exc:  # pragma: no cover - defensive runtime handling
             return {"success": False, "error": str(exc)}
 
-    def complete_mission(self, mission_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    def complete_mission(self, mission_id: str, result: dict[str, Any], client: Any | None = None) -> dict[str, Any]:
         """Mark a mission as completed and persist its execution result.
 
         Args:
             mission_id: The unique mission identifier.
             result: A dictionary payload describing the completed mission output.
+            client: Optional Supabase client. When ``None``, uses the shared client.
 
         Returns:
             A structured dictionary describing the operation result.
         """
 
-        if not self._client:
+        db_client = client if client is not None else self._client
+        if not db_client:
             return {"success": False, "error": "Supabase client is not available"}
 
         payload: dict[str, Any] = {
@@ -166,24 +182,26 @@ class MissionEngine:
         }
 
         try:
-            response = self._client.table("missions").update(payload).eq("id", mission_id).execute()
+            response = db_client.table("missions").update(payload).eq("id", mission_id).execute()
             record = self._normalize_mission(response.data[0]) if response.data else None
             return {"success": True, "mission": record}
         except Exception as exc:  # pragma: no cover - defensive runtime handling
             return {"success": False, "error": str(exc)}
 
-    def fail_mission(self, mission_id: str, error: str) -> dict[str, Any]:
+    def fail_mission(self, mission_id: str, error: str, client: Any | None = None) -> dict[str, Any]:
         """Mark a mission as failed and persist the error details.
 
         Args:
             mission_id: The unique mission identifier.
             error: A descriptive error message for the failed mission.
+            client: Optional Supabase client. When ``None``, uses the shared client.
 
         Returns:
             A structured dictionary describing the operation result.
         """
 
-        if not self._client:
+        db_client = client if client is not None else self._client
+        if not db_client:
             return {"success": False, "error": "Supabase client is not available"}
 
         payload: dict[str, Any] = {
@@ -193,7 +211,7 @@ class MissionEngine:
         }
 
         try:
-            response = self._client.table("missions").update(payload).eq("id", mission_id).execute()
+            response = db_client.table("missions").update(payload).eq("id", mission_id).execute()
             record = self._normalize_mission(response.data[0]) if response.data else None
             return {"success": True, "mission": record}
         except Exception as exc:  # pragma: no cover - defensive runtime handling

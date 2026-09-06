@@ -436,14 +436,15 @@ class ApprovalGateway:
         # write-through cache after a successful DB mutation.
         self._memory_store: dict[str, ApprovalRequest] = {}
 
-    def _repo(self) -> _ApprovalRepository:
+    def _repo(self, client: Any | None = None) -> _ApprovalRepository:
         """Return a repository bound to the current client.
 
         Resolved on every call so callers (notably tests) that mutate
         ``self._client`` after construction observe the change.
         """
 
-        return _ApprovalRepository(self._client, available=self._is_configured())
+        effective_client = client if client is not None else self._client
+        return _ApprovalRepository(effective_client, available=self._is_configured())
 
     def _repo_available(self) -> bool:
         if not self._is_configured():
@@ -459,14 +460,23 @@ class ApprovalGateway:
         action_type: str,
         risk_level: str,
         payload: dict[str, Any],
+        owner_id: str | None = None,
         ttl_hours: int = 24,
+        client: Any | None = None,
     ) -> dict[str, Any]:
         """Create a new approval request.
 
+        Args:
+            mission_id: Associated mission identifier.
+            action_type: Type of action requiring approval.
+            risk_level: Risk level classification.
+            payload: Action payload data.
+            owner_id: Canonical owner identifier (auth.users.id).
+            ttl_hours: Time-to-live in hours.
+            client: Optional Supabase client. When ``None``, uses the shared client.
+
         Returns:
-            ``{"success": True, "request": {...}}`` on success, or
-            ``{"success": False, "error": "..."}`` on failure. The
-            ``request`` payload is always a normalized dictionary.
+            Dictionary with success status and request details.
         """
 
         request_id = str(uuid4())
@@ -474,9 +484,9 @@ class ApprovalGateway:
         expires_iso = _plus_hours_iso(ttl_hours)
         safe_payload = _sanitize_metadata(payload)
 
-        repo = self._repo()
+        repo = self._repo(client)
         if repo.available:
-            db_payload = {
+            db_payload: dict[str, Any] = {
                 "id": request_id,
                 "mission_id": mission_id,
                 "action_type": action_type,
@@ -486,6 +496,8 @@ class ApprovalGateway:
                 "expires_at": expires_iso,
                 "metadata": safe_payload,
             }
+            if owner_id:
+                db_payload["owner_id"] = owner_id
             result = repo.insert(db_payload)
             if result.get("ok") is True:
                 normalized = self._normalize_request(result["row"])
@@ -510,7 +522,7 @@ class ApprovalGateway:
         self._memory_store[request_id] = request
         return {"success": True, "request": request.to_dict()}
 
-    def get_request(self, request_id: str) -> dict[str, Any] | None:
+    def get_request(self, request_id: str, client: Any | None = None) -> dict[str, Any] | None:
         """Retrieve an approval request by ID.
 
         The DB is consulted first when configured. The in-memory dict is
@@ -520,7 +532,7 @@ class ApprovalGateway:
         contract is preserved) and a warning is logged.
         """
 
-        repo = self._repo()
+        repo = self._repo(client)
         if repo.available:
             result = repo.select_by_id(request_id)
             if result.get("ok") is True:
@@ -547,6 +559,7 @@ class ApprovalGateway:
         mission_id: str | None = None,
         status: str | None = None,
         limit: int = 100,
+        client: Any | None = None,
     ) -> list[dict[str, Any]]:
         """List approval requests with optional filtering.
 
@@ -556,7 +569,7 @@ class ApprovalGateway:
         error so callers do not silently see stale memory.
         """
 
-        repo = self._repo()
+        repo = self._repo(client)
         if repo.available:
             result = repo.select_list(
                 mission_id=mission_id, status=status, limit=limit
@@ -583,6 +596,7 @@ class ApprovalGateway:
         self,
         request_id: str,
         approved_by: str | None = None,
+        client: Any | None = None,
     ) -> dict[str, Any]:
         """Approve a pending approval request.
 
@@ -604,7 +618,7 @@ class ApprovalGateway:
             "approved_by": approved_by,
         }
 
-        if self._repo().available:
+        if self._repo(client).available:
             return self._transition(
                 request_id=request_id,
                 from_status=STATUS_PENDING,
@@ -613,6 +627,7 @@ class ApprovalGateway:
                 on_terminal_idempotent=STATUS_APPROVED,
                 operation="approve",
                 actor=approved_by,
+                client=client,
             )
 
         # DB not configured: operate on the in-memory dict.
@@ -623,6 +638,7 @@ class ApprovalGateway:
         request_id: str,
         reason: str = "",
         rejected_by: str | None = None,
+        client: Any | None = None,
     ) -> dict[str, Any]:
         """Reject a pending approval request.
 
@@ -644,7 +660,7 @@ class ApprovalGateway:
             "reason": reason,
         }
 
-        if self._repo().available:
+        if self._repo(client).available:
             return self._transition(
                 request_id=request_id,
                 from_status=STATUS_PENDING,
@@ -654,6 +670,7 @@ class ApprovalGateway:
                 operation="reject",
                 actor=rejected_by,
                 reason=reason,
+                client=client,
             )
 
         return self._reject_in_memory(request_id, reason, rejected_by)
@@ -821,10 +838,11 @@ class ApprovalGateway:
         operation: str,
         actor: str | None = None,
         reason: str | None = None,
+        client: Any | None = None,
     ) -> dict[str, Any]:
         """Atomically transition a DB row from ``from_status`` to ``to_status``."""
 
-        result = self._repo().update_status_if(
+        result = self._repo(client).update_status_if(
             request_id,
             expected_status=from_status,
             new_status=to_status,

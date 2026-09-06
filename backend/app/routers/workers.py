@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict
 
 from app import database as database_module
-from app.dependencies import get_current_user_id, get_user_scoped_client
+from app.dependencies import get_current_user_id, get_user_scoped_client, verify_ownership
 from app.services.agent_orchestrator import AgentOrchestrator
 from app.services.worker_runtime import WorkerRuntime
 
@@ -88,8 +88,26 @@ async def create_worker(
 
 
 @router.get("/{worker_id}/status")
-async def get_worker_status(worker_id: str, current_user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
+async def get_worker_status(
+    worker_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
     """Return the runtime state for a worker owned by the current user."""
+
+    if not client:
+        return {"success": False, "error": "Supabase client unavailable"}
+
+    # Verify worker ownership
+    try:
+        response = client.table("workers").select("*").eq("id", worker_id).eq("owner_id", current_user_id).limit(1).execute()
+        rows = response.data or []
+        if not rows:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Worker not found")
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
     worker_runtime = WorkerRuntime(owner_id=current_user_id)
     state = worker_runtime.get_worker_state(worker_id)
@@ -97,8 +115,26 @@ async def get_worker_status(worker_id: str, current_user_id: str = Depends(get_c
 
 
 @router.post("/{worker_id}/run")
-async def run_worker(worker_id: str, current_user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
-    """Execute all pending missions for a worker."""
+async def run_worker(
+    worker_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
+    """Execute all pending missions for a worker owned by the current user."""
+
+    if not client:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Supabase client unavailable")
+
+    # Verify worker ownership
+    try:
+        response = client.table("workers").select("*").eq("id", worker_id).eq("owner_id", current_user_id).limit(1).execute()
+        rows = response.data or []
+        if not rows:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Worker not found")
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
     orchestrator = AgentOrchestrator(owner_id=current_user_id)
     result = orchestrator.run_worker(worker_id)

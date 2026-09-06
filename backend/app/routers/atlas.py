@@ -6,14 +6,20 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict
 
 from app import database as database_module
+from app.dependencies import get_current_user_id, get_user_scoped_client, verify_mission_ownership
+from app.services.mission_engine import MissionEngine
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/atlas", tags=["atlas"])
+router = APIRouter(
+    prefix="/atlas",
+    tags=["atlas"],
+    dependencies=[Depends(get_current_user_id)],
+)
 
 VALID_COMMAND_TYPES = (
     "CREATE_MISSION",
@@ -156,7 +162,7 @@ def _format_supabase_error(exc: Exception) -> str:
     return str(exc)
 
 
-def _build_mission_payload(request: MissionCreateRequest) -> dict[str, Any]:
+def _build_mission_payload(request: MissionCreateRequest, owner_id: str | None = None) -> dict[str, Any]:
     """Build a mission payload compatible with the current Supabase schema."""
 
     payload: dict[str, Any] = {
@@ -169,6 +175,8 @@ def _build_mission_payload(request: MissionCreateRequest) -> dict[str, Any]:
         "result": request.result or {},
         "retry_count": 0,
     }
+    if owner_id:
+        payload["owner_id"] = owner_id
     return payload
 
 
@@ -191,15 +199,19 @@ def _build_mission_update_payload(request: MissionPatchRequest) -> dict[str, Any
 
 
 @router.post("/mission", response_model=MissionCreateResponse)
-async def create_mission(request: MissionCreateRequest) -> MissionCreateResponse:
+async def create_mission(
+    request: Request,
+    body: MissionCreateRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> MissionCreateResponse:
     """Create a mission in the missions table."""
 
-    client = database_module.supabase_client
     if not client:
         raise HTTPException(status_code=500, detail="Supabase client unavailable")
 
     try:
-        mission_payload = _build_mission_payload(request)
+        mission_payload = _build_mission_payload(body, owner_id=current_user_id)
         mission_response = client.table("missions").insert(mission_payload).execute()
         mission_rows = mission_response.data or []
         if not mission_rows:
@@ -217,15 +229,18 @@ async def create_mission(request: MissionCreateRequest) -> MissionCreateResponse
 
 
 @router.get("/missions", response_model=list[MissionDetailResponse])
-async def list_missions() -> list[MissionDetailResponse]:
-    """Return all missions ordered by created_at descending."""
+async def list_missions(
+    request: Request,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> list[MissionDetailResponse]:
+    """Return all missions owned by the current user, ordered by created_at descending."""
 
-    client = database_module.supabase_client
     if not client:
         raise HTTPException(status_code=500, detail="Supabase client unavailable")
 
     try:
-        missions_response = client.table("missions").select("*").order("created_at", desc=True).execute()
+        missions_response = client.table("missions").select("*").eq("owner_id", current_user_id).order("created_at", desc=True).execute()
         mission_rows = missions_response.data or []
         return [MissionDetailResponse(**mission) for mission in mission_rows]
     except Exception as exc:
@@ -233,15 +248,19 @@ async def list_missions() -> list[MissionDetailResponse]:
 
 
 @router.get("/missions/{mission_id}", response_model=MissionDetailResponse)
-async def get_mission(mission_id: str) -> MissionDetailResponse:
-    """Return a single mission."""
+async def get_mission(
+    request: Request,
+    mission_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> MissionDetailResponse:
+    """Return a single mission owned by the current user."""
 
-    client = database_module.supabase_client
     if not client:
         raise HTTPException(status_code=500, detail="Supabase client unavailable")
 
     try:
-        mission_response = client.table("missions").select("*").execute()
+        mission_response = client.table("missions").select("*").eq("id", mission_id).eq("owner_id", current_user_id).limit(1).execute()
         mission_rows = mission_response.data or []
         mission = next((row for row in mission_rows if str(row.get("id")) == mission_id), None)
         if mission is None:
@@ -254,17 +273,31 @@ async def get_mission(mission_id: str) -> MissionDetailResponse:
 
 
 @router.patch("/missions/{mission_id}", response_model=MissionDetailResponse)
-async def patch_mission(mission_id: str, request: MissionPatchRequest) -> MissionDetailResponse:
-    """Patch the mutable mission fields for an existing mission."""
+async def patch_mission(
+    request: Request,
+    mission_id: str,
+    body: MissionPatchRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> MissionDetailResponse:
+    """Patch the mutable mission fields for an existing mission owned by the current user."""
 
-    client = database_module.supabase_client
     if not client:
         raise HTTPException(status_code=500, detail="Supabase client unavailable")
 
+    # Verify ownership first
+    mission_response = client.table("missions").select("*").eq("id", mission_id).eq("owner_id", current_user_id).limit(1).execute()
+    mission_rows = mission_response.data or []
+    if not mission_rows:
+        raise HTTPException(status_code=404, detail="Mission not found")
+
     try:
-        updates = _build_mission_update_payload(request)
+        updates = _build_mission_update_payload(body)
+        # Prevent ownership transfer - never allow owner_id to be changed
+        updates.pop("owner_id", None)
+
         try:
-            response = client.table("missions").update(updates).eq("id", mission_id).execute()
+            response = client.table("missions").update(updates).eq("id", mission_id).eq("owner_id", current_user_id).execute()
             rows = response.data or []
             if rows:
                 mission = rows[0]
@@ -274,7 +307,7 @@ async def patch_mission(mission_id: str, request: MissionPatchRequest) -> Missio
             mission = None
 
         if mission is None:
-            mission_rows_response = client.table("missions").select("*").execute()
+            mission_rows_response = client.table("missions").select("*").eq("id", mission_id).eq("owner_id", current_user_id).execute()
             mission_rows = mission_rows_response.data or []
             mission = next((row for row in mission_rows if str(row.get("id")) == mission_id), None)
             if mission is None:
@@ -294,22 +327,36 @@ async def patch_mission(mission_id: str, request: MissionPatchRequest) -> Missio
 
 
 @router.post("/command", response_model=AtlasCommandResponse)
-async def create_command(request: AtlasCommandCreateRequest) -> AtlasCommandResponse:
-    """Insert a new Atlas command into the command protocol table."""
+async def create_command(
+    request: Request,
+    body: AtlasCommandCreateRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> AtlasCommandResponse:
+    """Insert a new Atlas command into the command protocol table.
 
-    client = database_module.supabase_client
+    Verifies that the mission belongs to the current user before creating a command.
+    """
+
     if not client:
         raise HTTPException(status_code=500, detail="Supabase client unavailable")
 
-    if request.command_type not in VALID_COMMAND_TYPES:
+    if body.command_type not in VALID_COMMAND_TYPES:
         raise HTTPException(status_code=400, detail="Invalid command type")
+
+    # Verify mission ownership if mission_id is provided
+    if body.mission_id:
+        mission_engine = MissionEngine(client=client)
+        mission = mission_engine.get_mission(body.mission_id, client=client)
+        if mission is None or mission.get("owner_id") != current_user_id:
+            raise HTTPException(status_code=404, detail="Mission not found")
 
     try:
         payload: dict[str, Any] = {
-            "command_type": request.command_type,
-            "target_worker": request.target_worker,
-            "mission_id": request.mission_id,
-            "payload": request.payload or {},
+            "command_type": body.command_type,
+            "target_worker": body.target_worker,
+            "mission_id": body.mission_id,
+            "payload": body.payload or {},
             "status": "queued",
         }
         response = client.table("atlas_commands").insert(payload).execute()
@@ -326,32 +373,66 @@ async def create_command(request: AtlasCommandCreateRequest) -> AtlasCommandResp
 
 
 @router.get("/commands", response_model=list[AtlasCommandResponse])
-async def list_commands() -> list[AtlasCommandResponse]:
-    """Return all registered Atlas commands with their current status."""
+async def list_commands(
+    request: Request,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> list[AtlasCommandResponse]:
+    """Return Atlas commands for missions owned by the current user.
 
-    client = database_module.supabase_client
+    Uses explicit two-step ownership-safe query:
+    1. Get all missions owned by current_user_id
+    2. Query commands for those missions only
+    """
+
     if not client:
         raise HTTPException(status_code=500, detail="Supabase client unavailable")
 
     try:
-        response = client.table("atlas_commands").select("*").execute()
+        # Step 1: Get all missions owned by the current user
+        missions_response = client.table("missions").select("id").eq("owner_id", current_user_id).execute()
+        mission_ids = [row["id"] for row in (missions_response.data or [])]
+
+        if not mission_ids:
+            return []
+
+        # Step 2: Get commands for those missions only
+        response = client.table("atlas_commands").select("*").in_("mission_id", mission_ids).execute()
         rows = response.data or []
         return [AtlasCommandResponse(**row) for row in rows]
     except Exception as exc:
+        logger.exception("Failed to fetch commands: %s", str(exc))
         raise HTTPException(status_code=500, detail="Failed to fetch commands") from exc
 
 
 @router.get("/worker-responses", response_model=list[WorkerResponseRecord])
-async def list_worker_responses() -> list[WorkerResponseRecord]:
-    """Return worker responses ordered from newest to oldest."""
+async def list_worker_responses(
+    request: Request,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> list[WorkerResponseRecord]:
+    """Return worker responses for missions owned by the current user.
 
-    client = database_module.supabase_client
+    Uses explicit two-step ownership-safe query:
+    1. Get all missions owned by current_user_id
+    2. Query worker_responses for those missions only
+    """
+
     if not client:
         raise HTTPException(status_code=500, detail="Supabase client unavailable")
 
     try:
-        response = client.table("worker_responses").select("*").order("created_at", desc=True).execute()
+        # Step 1: Get all missions owned by the current user
+        missions_response = client.table("missions").select("id").eq("owner_id", current_user_id).execute()
+        mission_ids = [row["id"] for row in (missions_response.data or [])]
+
+        if not mission_ids:
+            return []
+
+        # Step 2: Get worker_responses for those missions only
+        response = client.table("worker_responses").select("*").in_("mission_id", mission_ids).order("created_at", desc=True).execute()
         rows = response.data or []
         return [WorkerResponseRecord(**row) for row in rows]
     except Exception as exc:
+        logger.exception("Failed to fetch worker responses: %s", str(exc))
         raise HTTPException(status_code=500, detail="Failed to fetch worker responses") from exc

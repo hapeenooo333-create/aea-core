@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 
-from app.dependencies import get_current_user_id
+from app.dependencies import get_current_user_id, get_user_scoped_client
 from app.services.connectors.pinterest_connector import PinterestConnector
 from app.services.connectors.registry import ConnectorRegistry
 from app.services.human_intervention import HumanInterventionManager
@@ -64,7 +64,7 @@ class OnboardingStartRequest(BaseModel):
 
 
 class OnboardingResumeRequest(BaseModel):
-    """Request to resume platform onboarding."""
+    """Request to resume an onboarding workflow."""
 
     workflow_id: str
     checkpoint_id: str | None = None
@@ -133,10 +133,29 @@ async def connector_health(platform: str) -> dict[str, Any]:
 
 
 @router.post("/onboarding/start")
-async def start_onboarding(request: OnboardingStartRequest) -> dict[str, Any]:
-    """Start a platform onboarding workflow."""
+async def start_onboarding(
+    request: OnboardingStartRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
+    """Start a platform onboarding workflow for a worker owned by the current user."""
     platform = request.platform
     worker_id = request.worker_id
+
+    # Verify worker ownership
+    if client:
+        try:
+            response = client.table("workers").select("*").eq("id", worker_id).eq("owner_id", current_user_id).limit(1).execute()
+            rows = response.data or []
+            if not rows:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Worker not found",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
     registry = get_connector_registry()
     if not registry.has_connector(platform):
@@ -155,9 +174,27 @@ async def start_onboarding(request: OnboardingStartRequest) -> dict[str, Any]:
 
 
 @router.get("/onboarding/{workflow_id}")
-async def get_onboarding_status(workflow_id: str) -> dict[str, Any]:
-    """Get the status of an onboarding workflow."""
+async def get_onboarding_status(
+    workflow_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
+    """Get the status of an onboarding workflow owned by the current user."""
     # TODO: Retrieve workflow status from database or connector state
+    # Verify ownership through onboarding_workflows table
+    if client:
+        try:
+            response = client.table("onboarding_workflows").select("*").eq("id", workflow_id).eq("owner_id", current_user_id).limit(1).execute()
+            rows = response.data or []
+            if not rows:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Workflow not found",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
     return {
         "success": False,
         "error": "Workflow status retrieval not yet fully implemented",
@@ -166,10 +203,27 @@ async def get_onboarding_status(workflow_id: str) -> dict[str, Any]:
 
 
 @router.post("/onboarding/{workflow_id}/resume")
-async def resume_onboarding(workflow_id: str, request: OnboardingResumeRequest) -> dict[str, Any]:
+async def resume_onboarding(
+    workflow_id: str,
+    request: OnboardingResumeRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
     """Resume an onboarding workflow after human intervention."""
-    # Extract platform from workflow metadata if possible
-    # For MVP, this would be stored in database
+    # Verify workflow ownership
+    if client:
+        try:
+            response = client.table("onboarding_workflows").select("*").eq("id", workflow_id).eq("owner_id", current_user_id).limit(1).execute()
+            rows = response.data or []
+            if not rows:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Workflow not found",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
     return {
         "success": False,
         "error": "Workflow resume not yet fully implemented",
@@ -181,13 +235,25 @@ async def resume_onboarding(workflow_id: str, request: OnboardingResumeRequest) 
 async def list_pending_checkpoints(
     mission_id: str | None = None,
     platform: str | None = None,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
 ) -> dict[str, Any]:
-    """List pending human intervention checkpoints."""
+    """List pending human intervention checkpoints for the current user's missions."""
     manager = get_human_intervention_manager()
     checkpoints = manager.list_pending_checkpoints(
         mission_id=mission_id,
         platform=platform,
     )
+    # Filter checkpoints by ownership if client is available
+    if client and mission_id:
+        try:
+            # Verify mission ownership
+            mission_response = client.table("missions").select("owner_id").eq("id", mission_id).eq("owner_id", current_user_id).limit(1).execute()
+            mission_rows = mission_response.data or []
+            if not mission_rows:
+                checkpoints = []
+        except Exception:
+            checkpoints = []
     return {
         "success": True,
         "checkpoints": checkpoints,
@@ -196,8 +262,15 @@ async def list_pending_checkpoints(
 
 
 @router.get("/checkpoints/{checkpoint_id}")
-async def get_checkpoint(checkpoint_id: str) -> dict[str, Any]:
-    """Get a specific human intervention checkpoint."""
+async def get_checkpoint(
+    checkpoint_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
+    """Get a specific human intervention checkpoint owned by the current user.
+
+    The checkpoint itself must resolve to a mission that belongs to current_user_id.
+    """
     manager = get_human_intervention_manager()
     checkpoint = manager.get_checkpoint(checkpoint_id)
 
@@ -207,6 +280,25 @@ async def get_checkpoint(checkpoint_id: str) -> dict[str, Any]:
             detail=f"Checkpoint '{checkpoint_id}' not found",
         )
 
+    # Verify checkpoint ownership through mission_id stored in checkpoint
+    mission_id = checkpoint.get("mission_id")
+    if mission_id and client:
+        try:
+            mission_response = client.table("missions").select("owner_id").eq("id", mission_id).eq("owner_id", current_user_id).limit(1).execute()
+            mission_rows = mission_response.data or []
+            if not mission_rows:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Checkpoint '{checkpoint_id}' not found",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Checkpoint '{checkpoint_id}' not found",
+            )
+
     return {
         "success": True,
         "checkpoint": checkpoint,
@@ -214,9 +306,44 @@ async def get_checkpoint(checkpoint_id: str) -> dict[str, Any]:
 
 
 @router.post("/checkpoints/{checkpoint_id}/complete")
-async def complete_checkpoint(checkpoint_id: str, request: CheckpointCompleteRequest) -> dict[str, Any]:
-    """Mark a checkpoint as completed by the human."""
+async def complete_checkpoint(
+    checkpoint_id: str,
+    request: CheckpointCompleteRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
+    """Mark a checkpoint as completed by the human.
+
+    The checkpoint must resolve to a mission that belongs to current_user_id.
+    """
     manager = get_human_intervention_manager()
+    checkpoint = manager.get_checkpoint(checkpoint_id)
+
+    if not checkpoint:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Checkpoint '{checkpoint_id}' not found",
+        )
+
+    # Verify checkpoint ownership through mission_id stored in checkpoint
+    mission_id = checkpoint.get("mission_id")
+    if mission_id and client:
+        try:
+            mission_response = client.table("missions").select("owner_id").eq("id", mission_id).eq("owner_id", current_user_id).limit(1).execute()
+            mission_rows = mission_response.data or []
+            if not mission_rows:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Checkpoint '{checkpoint_id}' not found",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Checkpoint '{checkpoint_id}' not found",
+            )
+
     result = manager.complete_checkpoint(
         checkpoint_id,
         human_input=request.human_input,

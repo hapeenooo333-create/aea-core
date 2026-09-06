@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from typing import Any
-
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict
 
+from app.dependencies import get_current_user_id, get_user_scoped_client, verify_ownership
 from app.services.approval_gateway import ApprovalGateway
 from app.services.approval_resume_service import ApprovalResumeService
 from app.services.connectors.pinterest_connector import PinterestConnector
@@ -14,21 +14,21 @@ from app.services.connectors.registry import ConnectorRegistry
 from app.services.human_intervention import HumanInterventionManager
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
-approval_gateway = ApprovalGateway()
 
 
-def _build_resume_service() -> ApprovalResumeService:
+def _build_resume_service(current_user_id: str | None = None) -> ApprovalResumeService:
     """Construct an ``ApprovalResumeService`` with the canonical registry."""
+
     registry = ConnectorRegistry()
     registry.register(PinterestConnector())
     return ApprovalResumeService(
-        approval_gateway=approval_gateway,
+        approval_gateway=ApprovalGateway(),
         connector_registry=registry,
         human_intervention_manager=HumanInterventionManager(),
     )
 
 
-resume_service: ApprovalResumeService = _build_resume_service()
+resume_service = _build_resume_service()
 
 
 class ApprovalApproveRequest(BaseModel):
@@ -58,50 +58,92 @@ class ApprovalListFilters(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.get("/{approval_id}")
-async def get_approval(approval_id: str) -> dict[str, Any]:
-    """Retrieve a specific approval request."""
+def _get_approval_gateway(client: Any | None = None) -> ApprovalGateway:
+    """Get an ApprovalGateway instance with optional scoped client."""
+    return ApprovalGateway(client=client)
 
-    approval = approval_gateway.get_request(approval_id)
-    if not approval:
+
+def _get_resume_service(current_user_id: str) -> ApprovalResumeService:
+    """Get an ApprovalResumeService scoped to the current user."""
+    client = None
+    try:
+        from app.dependencies import get_user_scoped_client
+        client = get_user_scoped_client(request=None)  # type: ignore
+    except Exception:
+        pass
+    registry = ConnectorRegistry()
+    registry.register(PinterestConnector())
+    return ApprovalResumeService(
+        approval_gateway=ApprovalGateway(client=client),
+        connector_registry=registry,
+        human_intervention_manager=HumanInterventionManager(),
+    )
+
+
+@router.get("/{approval_id}")
+async def get_approval(
+    approval_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
+    """Retrieve a specific approval request owned by the current user."""
+
+    gateway = _get_approval_gateway(client)
+    approval = gateway.get_request(approval_id, client=client)
+    if approval is None or approval.get("owner_id") != current_user_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval request not found")
     return {"success": True, "approval": approval}
 
 
 @router.get("")
-async def list_approvals(mission_id: str | None = None, status_filter: str | None = None, limit: int = 100) -> dict[str, Any]:
-    """List approval requests with optional filtering.
+async def list_approvals(
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+    mission_id: str | None = None,
+    status_filter: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """List approval requests owned by the current user with optional filtering."""
 
-    Query Parameters:
-        mission_id: Optional filter by mission ID
-        status_filter: Optional filter by status (pending, approved, rejected, expired)
-        limit: Maximum number of results (default: 100)
-    """
-
-    approvals = approval_gateway.list_requests(
+    gateway = _get_approval_gateway(client)
+    approvals = gateway.list_requests(
         mission_id=mission_id,
         status=status_filter,
         limit=limit,
+        client=client,
     )
-    return {"success": True, "approvals": approvals, "count": len(approvals)}
+    # Filter to only current user's approvals for defense in depth
+    user_approvals = [a for a in approvals if a.get("owner_id") == current_user_id]
+    return {"success": True, "approvals": user_approvals, "count": len(user_approvals)}
 
 
 @router.post("/{approval_id}/approve", status_code=status.HTTP_200_OK)
-async def approve_approval(approval_id: str, request: ApprovalApproveRequest) -> dict[str, Any]:
+async def approve_approval(
+    approval_id: str,
+    request: ApprovalApproveRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
     """Approve a pending approval request and trigger resume.
 
-    On success the response includes the persisted approval record plus a
-    ``resume`` field describing the outcome of the resume pipeline.
+    The authenticated user must own the approval request.
+    The ``approved_by`` field is derived from current_user_id,
+    never from the request body.
     """
 
-    result = approval_gateway.approve_request(approval_id, approved_by=request.approved_by)
+    gateway = _get_approval_gateway(client)
+    approval = gateway.get_request(approval_id, client=client)
+    if approval is None or approval.get("owner_id") != current_user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval request not found")
+
+    result = gateway.approve_request(approval_id, approved_by=current_user_id)
 
     if not result.get("success"):
         error = result.get("error", "Failed to approve request")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error))
 
     approval = result.get("request")
-    resume_result = resume_service.resume(approval_id)
+    resume_result = resume_service.resume(approval_id, current_user_id=current_user_id)
     return {
         "success": True,
         "approval": approval,
@@ -110,16 +152,28 @@ async def approve_approval(approval_id: str, request: ApprovalApproveRequest) ->
 
 
 @router.post("/{approval_id}/reject", status_code=status.HTTP_200_OK)
-async def reject_approval(approval_id: str, request: ApprovalRejectRequest) -> dict[str, Any]:
+async def reject_approval(
+    approval_id: str,
+    request: ApprovalRejectRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
     """Reject a pending approval request.
 
-    Rejection does not invoke the resume pipeline.
+    The authenticated user must own the approval request.
+    The ``rejected_by`` field is derived from current_user_id,
+    never from the request body.
     """
 
-    result = approval_gateway.reject_request(
+    gateway = _get_approval_gateway(client)
+    approval = gateway.get_request(approval_id, client=client)
+    if approval is None or approval.get("owner_id") != current_user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval request not found")
+
+    result = gateway.reject_request(
         approval_id,
         reason=request.reason or "",
-        rejected_by=request.rejected_by,
+        rejected_by=current_user_id,
     )
 
     if not result.get("success"):

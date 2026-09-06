@@ -60,6 +60,34 @@ def get_supabase_client() -> Any:
         return None
 
 
+def get_supabase_url() -> str:
+    """Return the configured Supabase URL, or an empty string."""
+    url, _ = _resolve_supabase_credential()
+    return url
+
+
+def get_supabase_client_for_user(user_access_token: str) -> Any:
+    """Create a Supabase client scoped to a specific user's access token.
+
+    The returned client sends ``user_access_token`` as the API key on
+    every request. PostgreSQL RLS therefore evaluates ``auth.uid()``
+    against the authenticated user identity embedded in that token.
+
+    The caller's raw token is never logged, persisted, or returned in
+    responses by this function. It is consumed only to construct the
+    client.
+    """
+    url, _ = _resolve_supabase_credential()
+    if not url:
+        return None
+    try:
+        from supabase import create_client
+
+        return create_client(url, user_access_token)
+    except Exception:  # pragma: no cover - defensive runtime handling
+        return None
+
+
 # Initialize on import if configured
 if is_supabase_configured():
     supabase_client = get_supabase_client()
