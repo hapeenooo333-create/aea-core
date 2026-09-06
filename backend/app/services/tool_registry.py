@@ -28,6 +28,7 @@ class ToolRegistry:
         name: str,
         description: str,
         tool_type: str = "internal",
+        schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Register a new tool definition.
 
@@ -35,6 +36,7 @@ class ToolRegistry:
             name: The unique tool identifier.
             description: A brief explanation of the tool's purpose.
             tool_type: The tool category, such as ``internal`` or ``external``.
+            schema: Optional JSON schema for payload validation.
 
         Returns:
             A structured dictionary describing the registration outcome.
@@ -49,6 +51,8 @@ class ToolRegistry:
             "description": description or "",
             "tool_type": tool_type or "internal",
         }
+        if schema is not None:
+            tool_payload["schema"] = schema
         self._tools[normalized_name] = tool_payload
         return {"success": True, "tool": tool_payload}
 

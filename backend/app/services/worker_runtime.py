@@ -50,7 +50,7 @@ class WorkerRuntime:
         )
 
     def execute_mission(self, mission_id: str) -> dict[str, Any]:
-        """Execute a mission through the employee loop workflow.
+        """Execute a mission through the durable employee loop workflow.
 
         Args:
             mission_id: The unique mission identifier to execute.
@@ -73,6 +73,39 @@ class WorkerRuntime:
             pass
 
         return self._employee_engine.run_mission(mission_id)
+
+    def resume_mission(self, mission_id: str) -> dict[str, Any]:
+        """Resume a mission from persistent state after restart.
+
+        Args:
+            mission_id: The unique mission identifier to resume.
+
+        Returns:
+            A structured dictionary describing the outcome of the resume flow.
+        """
+        return self._employee_engine.resume_mission(mission_id)
+
+    def resume_after_approval(
+        self,
+        mission_id: str,
+        execution_id: str,
+        worker_id: str,
+        approval_request_id: str,
+    ) -> dict[str, Any]:
+        """Resume execution after approval is granted.
+
+        Args:
+            mission_id: The mission identifier.
+            execution_id: The execution identifier.
+            worker_id: The worker identifier.
+            approval_request_id: The approval request ID.
+
+        Returns:
+            A structured dictionary describing the outcome.
+        """
+        return self._employee_engine.resume_after_approval(
+            mission_id, execution_id, worker_id, approval_request_id,
+        )
 
     def execute_action_with_approval(
         self,
