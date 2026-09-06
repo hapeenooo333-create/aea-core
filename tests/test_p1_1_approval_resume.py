@@ -442,9 +442,13 @@ def test_existing_approval_gateway_flow_still_works(approval_gateway):
     assert approval_gateway.is_approved(request_id)
 
     approval_gateway.reject_request("other-id", reason="x")
-    # second approval attempt must fail because the request is already approved
+    # P1-2: second approval of an already-approved request is idempotent
+    # at the state level — the DB state is the source of truth and the
+    # already-terminal record is returned without a second state change.
     second = approval_gateway.approve_request(request_id)
-    assert not second["success"]
+    assert second["success"] is True
+    assert second.get("idempotent") is True
+    assert second["request"]["status"] == "approved"
 
 
 def test_existing_p0_5_persistence_still_works(stores):

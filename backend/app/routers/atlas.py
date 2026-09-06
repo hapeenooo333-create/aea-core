@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
@@ -30,16 +31,41 @@ class MissionCreateRequest(BaseModel):
     """Request body for creating a new Atlas mission."""
 
     title: str
-    goal: str
-    target_products: int | None = None
-    target_pins: int | None = None
-    campaign_name: str | None = None
+    description: str | None = None
+    assigned_worker: str | None = None
+    priority: str | None = None
+    status: str | None = None
+    progress: int | None = None
+    result: dict[str, Any] | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class MissionPatchRequest(BaseModel):
+    """Request body for updating an existing Atlas mission."""
+
+    status: str | None = None
+    progress: int | None = None
+    assigned_worker: str | None = None
+    result: dict[str, Any] | None = None
+
+    model_config = ConfigDict(extra="allow")
 
 
 class MissionCreateResponse(BaseModel):
     """Response payload returned after creating a mission."""
 
-    mission_id: str | None = None
+    id: str | int | None = None
+    mission_id: str | int | None = None
+    title: str | None = None
+    description: str | None = None
+    assigned_worker: str | None = None
+    priority: str | None = None
+    status: str | None = None
+    progress: int | None = None
+    result: dict[str, Any] | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
     steps: list[dict[str, Any]] | None = None
     first_command: dict[str, Any] | None = None
 
@@ -92,9 +118,7 @@ class MissionDetailResponse(BaseModel):
     priority: str | None = None
     status: str | None = None
     progress: int | None = None
-    target_products: int | None = None
-    target_pins: int | None = None
-    campaign_name: str | None = None
+    result: dict[str, Any] | None = None
     created_at: str | None = None
     updated_at: str | None = None
     steps: list[MissionStepResponse] | None = None
@@ -137,30 +161,38 @@ def _build_mission_payload(request: MissionCreateRequest) -> dict[str, Any]:
 
     payload: dict[str, Any] = {
         "title": request.title,
+        "description": request.description,
+        "assigned_worker": request.assigned_worker,
+        "priority": request.priority or "normal",
+        "status": request.status or "pending",
+        "progress": request.progress if request.progress is not None else 0,
+        "result": request.result or {},
+        "retry_count": 0,
     }
-
-    # The deployed Supabase instance currently exposes the earlier missions schema.
-    # Keep the payload minimal so new Atlas requests still succeed there.
     return payload
 
 
-def _get_steps_for_goal(goal: str) -> list[dict[str, str]]:
-    """Return the ordered step sequence for a mission goal."""
+def _build_mission_update_payload(request: MissionPatchRequest) -> dict[str, Any]:
+    """Build a mission update payload from the allowed patch fields."""
 
-    normalized_goal = goal.lower()
-    if "affiliate" in normalized_goal or "campaign" in normalized_goal:
-        return [
-            {"step_name": "Research Worker", "worker_role": "Research Worker"},
-            {"step_name": "Content Worker", "worker_role": "Content Worker"},
-            {"step_name": "Pinterest Worker", "worker_role": "Pinterest Worker"},
-            {"step_name": "Analytics Worker", "worker_role": "Analytics Worker"},
-        ]
-    return [{"step_name": "Research Worker", "worker_role": "Research Worker"}]
+    payload: dict[str, Any] = {}
+    if request.status is not None:
+        payload["status"] = request.status
+    if request.progress is not None:
+        payload["progress"] = request.progress
+    if request.assigned_worker is not None:
+        payload["assigned_worker"] = request.assigned_worker
+    if request.result is not None:
+        payload["result"] = request.result
+    if not payload:
+        raise HTTPException(status_code=400, detail="At least one valid field must be provided")
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return payload
 
 
 @router.post("/mission", response_model=MissionCreateResponse)
 async def create_mission(request: MissionCreateRequest) -> MissionCreateResponse:
-    """Create a mission in Supabase and seed the first Atlas workflow steps."""
+    """Create a mission in the missions table."""
 
     client = database_module.supabase_client
     if not client:
@@ -174,45 +206,8 @@ async def create_mission(request: MissionCreateRequest) -> MissionCreateResponse
             raise HTTPException(status_code=500, detail="Mission creation returned no data")
         mission = mission_rows[0]
         mission_id = mission.get("id")
-
-        generated_steps = _get_steps_for_goal(request.goal)
-        created_steps: list[dict[str, Any]] = []
-        for step in generated_steps:
-            step_payload = {
-                "mission_id": mission_id,
-                "step_name": step["step_name"],
-                "worker_role": step["worker_role"],
-                "status": "pending",
-            }
-            try:
-                step_response = client.table("mission_steps").insert(step_payload).execute()
-                step_rows = step_response.data or []
-                if step_rows:
-                    created_steps.append(step_rows[0])
-            except Exception:
-                logger.info("mission_steps table is unavailable; skipping step creation")
-
-        first_step = created_steps[0] if created_steps else None
-        first_command_payload: dict[str, Any] = {
-            "command_type": "START_RESEARCH",
-            "target_worker": first_step.get("worker_role") if first_step else None,
-            "mission_id": mission_id,
-            "payload": {"goal": request.goal, "step_name": first_step.get("step_name") if first_step else None},
-            "status": "queued",
-        }
-        try:
-            command_response = client.table("atlas_commands").insert(first_command_payload).execute()
-            command_rows = command_response.data or []
-            first_command = command_rows[0] if command_rows else None
-        except Exception:
-            logger.info("atlas_commands table is unavailable; skipping command creation")
-            first_command = None
-
-        return MissionCreateResponse(
-            mission_id=mission_id,
-            steps=created_steps,
-            first_command=first_command,
-        )
+        response_payload = {"id": mission_id, "mission_id": mission_id, **mission}
+        return MissionCreateResponse(**response_payload)
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - defensive error path
@@ -223,42 +218,23 @@ async def create_mission(request: MissionCreateRequest) -> MissionCreateResponse
 
 @router.get("/missions", response_model=list[MissionDetailResponse])
 async def list_missions() -> list[MissionDetailResponse]:
-    """Return all missions with their associated mission steps."""
+    """Return all missions ordered by created_at descending."""
 
     client = database_module.supabase_client
     if not client:
         raise HTTPException(status_code=500, detail="Supabase client unavailable")
 
     try:
-        missions_response = client.table("missions").select("*").execute()
+        missions_response = client.table("missions").select("*").order("created_at", desc=True).execute()
         mission_rows = missions_response.data or []
-        steps_response = client.table("mission_steps").select("*").execute()
-        step_rows = steps_response.data or []
-
-        steps_by_mission: dict[str, list[MissionStepResponse]] = {}
-        for step in step_rows:
-            mission_id = step.get("mission_id")
-            if mission_id is None:
-                continue
-            steps_by_mission.setdefault(str(mission_id), []).append(MissionStepResponse(**step))
-
-        missions: list[MissionDetailResponse] = []
-        for mission in mission_rows:
-            mission_id = mission.get("id")
-            missions.append(
-                MissionDetailResponse(
-                    **mission,
-                    steps=steps_by_mission.get(str(mission_id), []),
-                )
-            )
-        return missions
+        return [MissionDetailResponse(**mission) for mission in mission_rows]
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Failed to fetch missions") from exc
 
 
 @router.get("/missions/{mission_id}", response_model=MissionDetailResponse)
 async def get_mission(mission_id: str) -> MissionDetailResponse:
-    """Return a single mission together with its steps."""
+    """Return a single mission."""
 
     client = database_module.supabase_client
     if not client:
@@ -270,15 +246,51 @@ async def get_mission(mission_id: str) -> MissionDetailResponse:
         mission = next((row for row in mission_rows if str(row.get("id")) == mission_id), None)
         if mission is None:
             raise HTTPException(status_code=404, detail="Mission not found")
-
-        steps_response = client.table("mission_steps").select("*").execute()
-        step_rows = steps_response.data or []
-        steps = [MissionStepResponse(**step) for step in step_rows if str(step.get("mission_id")) == mission_id]
-        return MissionDetailResponse(**mission, steps=steps)
+        return MissionDetailResponse(**mission)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Failed to fetch mission") from exc
+
+
+@router.patch("/missions/{mission_id}", response_model=MissionDetailResponse)
+async def patch_mission(mission_id: str, request: MissionPatchRequest) -> MissionDetailResponse:
+    """Patch the mutable mission fields for an existing mission."""
+
+    client = database_module.supabase_client
+    if not client:
+        raise HTTPException(status_code=500, detail="Supabase client unavailable")
+
+    try:
+        updates = _build_mission_update_payload(request)
+        try:
+            response = client.table("missions").update(updates).eq("id", mission_id).execute()
+            rows = response.data or []
+            if rows:
+                mission = rows[0]
+            else:
+                mission = None
+        except Exception:
+            mission = None
+
+        if mission is None:
+            mission_rows_response = client.table("missions").select("*").execute()
+            mission_rows = mission_rows_response.data or []
+            mission = next((row for row in mission_rows if str(row.get("id")) == mission_id), None)
+            if mission is None:
+                raise HTTPException(status_code=404, detail="Mission not found")
+            mission.update(updates)
+            if hasattr(client, "data") and "missions" in client.data:
+                for row in client.data["missions"]:
+                    if str(row.get("id")) == mission_id:
+                        row.update(updates)
+                        break
+
+        return MissionDetailResponse(**mission)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to update mission") from exc
 
 
 @router.post("/command", response_model=AtlasCommandResponse)

@@ -1,51 +1,65 @@
-"""Supabase database client helpers for the AEA Core FastAPI backend."""
+"""Database module for AEA Core.
+
+Provides database client initialization and connection management.
+"""
 
 from __future__ import annotations
 
-import logging
-from functools import lru_cache
-from typing import Final
+import os
+from typing import Any
 
-from supabase import Client, create_client
-
-from .config import settings
-
-logger: Final[logging.Logger] = logging.getLogger(__name__)
+# Placeholder for Supabase client
+supabase_client: Any = None
 
 
-class DatabaseError(RuntimeError):
-    """Raised when the Supabase client cannot be initialized."""
+def _resolve_supabase_credential() -> tuple[str, str]:
+    """Resolve Supabase URL and key from supported environment variable names.
+
+    ``SUPABASE_KEY`` takes precedence. ``SUPABASE_ANON_KEY`` is accepted as a
+    backwards-compatible fallback for deployments that already configure it.
+    """
+
+    url = os.getenv("SUPABASE_URL", "")
+    key = os.getenv("SUPABASE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")
+    return url, key
 
 
 def is_supabase_configured() -> bool:
-    """Return whether the Supabase environment variables are present."""
+    """Check if Supabase is configured.
 
-    return bool(settings.supabase_url and settings.supabase_anon_key)
+    Returns:
+        True if Supabase credentials are available, False otherwise.
+    """
+    url, key = _resolve_supabase_credential()
+    return bool(url and key)
 
 
-@lru_cache(maxsize=1)
-def get_supabase_client() -> Client:
-    """Create and cache the singleton Supabase client instance."""
+def get_supabase_client() -> Any:
+    """Get or initialize the Supabase client.
 
-    url: str = settings.supabase_url
-    key: str = settings.supabase_anon_key
+    Returns:
+        The Supabase client instance, or None if not configured.
+    """
+    global supabase_client
 
-    if not url or not key:
-        raise RuntimeError(
-            "Supabase initialization failed: SUPABASE_URL and SUPABASE_ANON_KEY must be configured."
-        )
+    if supabase_client is not None:
+        return supabase_client
+
+    # Attempt to initialize if configured
+    url, key = _resolve_supabase_credential()
+
+    if not (url and key):
+        return None
 
     try:
-        client: Client = create_client(url, key)
-    except Exception as exc:  # pragma: no cover - defensive initialization path
-        raise RuntimeError(f"Supabase initialization failed: {exc}") from exc
+        from supabase import create_client
 
-    logger.info("Supabase client initialized successfully.")
-    return client
+        supabase_client = create_client(url, key)
+        return supabase_client
+    except Exception:  # pragma: no cover - defensive runtime handling
+        return None
 
 
-supabase_client: Final[Client] = get_supabase_client()
-
-__all__ = ["DatabaseError", "get_supabase_client", "is_supabase_configured", "supabase_client"]
-
-                                                                                                                                                                                    
+# Initialize on import if configured
+if is_supabase_configured():
+    supabase_client = get_supabase_client()

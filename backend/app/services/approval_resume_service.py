@@ -345,7 +345,11 @@ class ApprovalResumeService:
         connector: Any,
     ) -> dict[str, Any]:
         """Handle resume of ``start_platform_onboarding``."""
-        result = connector.start_onboarding(worker_id, mission_id=mission_id)
+        result = connector.start_onboarding(
+            worker_id,
+            mission_id=mission_id,
+            approval_id=approval_request_id,
+        )
         workflow_id = result.get("workflow_id")
 
         if result.get("requires_human_intervention"):
