@@ -57,6 +57,7 @@ class EmployeeEngine:
         self,
         connector_registry: ConnectorRegistry | None = None,
         owner_id: str | None = None,
+        client: Any | None = None,
     ) -> None:
         """Initialize the employee engine with supporting services.
 
@@ -66,7 +67,7 @@ class EmployeeEngine:
         """
 
         self._owner_id = owner_id
-        self._mission_engine = MissionEngine()
+        self._mission_engine = MissionEngine(client=client)
         self._memory_engine = AtlasMemoryEngine()
         self._decision_engine = AtlasDecisionEngine(owner_id=owner_id)
         self._action_engine = ActionEngine(owner_id=owner_id)
@@ -75,7 +76,7 @@ class EmployeeEngine:
         self._tool_registry = ToolRegistry()
         self._connector_registry = connector_registry
         self._human_intervention_manager = HumanInterventionManager()
-        self._execution_service = MissionExecutionService()
+        self._execution_service = MissionExecutionService(client=client)
         self._retry_policy = BoundedRetryPolicy()
         self._tool_validator = ToolValidator(self._tool_registry, self._action_engine)
         self._safe_executor = SafeActionExecutor(self._tool_validator, self._worker_runtime_stub())

@@ -26,7 +26,12 @@ from .connectors.registry import ConnectorRegistry
 class WorkerRuntime:
     """Coordinate mission execution with the existing lightweight services."""
 
-    def __init__(self, connector_registry: ConnectorRegistry | None = None, owner_id: str | None = None) -> None:
+    def __init__(
+        self,
+        connector_registry: ConnectorRegistry | None = None,
+        owner_id: str | None = None,
+        client: Any | None = None,
+    ) -> None:
         """Initialize the runtime with its supporting engines.
 
         Args:
@@ -37,7 +42,7 @@ class WorkerRuntime:
         """
 
         self._owner_id = owner_id
-        self._mission_engine = MissionEngine()
+        self._mission_engine = MissionEngine(client=client)
         self._memory_engine = AtlasMemoryEngine()
         self._decision_engine = AtlasDecisionEngine(owner_id=owner_id)
         self._action_engine = ActionEngine(owner_id=owner_id)
@@ -47,6 +52,7 @@ class WorkerRuntime:
         self._employee_engine = EmployeeEngine(
             connector_registry=connector_registry,
             owner_id=owner_id,
+            client=client,
         )
 
     def execute_mission(self, mission_id: str) -> dict[str, Any]:

@@ -14,6 +14,7 @@ This module adds verification tests for:
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, Request
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.routers.missions import router as missions_router
 from app.routers.workers import router as workers_router
+import app.routers.workers as workers_module
 from app.routers.atlas import router as atlas_router
 
 
@@ -783,6 +785,50 @@ class TestPhaseDOwnerIsolation:
 
 class TestPhaseDSecurityRegression:
     """Phase D: Security regression verification."""
+
+    def test_authenticated_worker_execution_keeps_scoped_client(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The authenticated worker route passes its client to durable execution."""
+        from app.dependencies import get_user_scoped_client
+        from app.services.agent_orchestrator import AgentOrchestrator as RealAgentOrchestrator
+
+        class ScopedClient:
+            def table(self, _table_name: str) -> "ScopedClient":
+                return self
+
+            def select(self, *_args: object, **_kwargs: object) -> "ScopedClient":
+                return self
+
+            def eq(self, *_args: object, **_kwargs: object) -> "ScopedClient":
+                return self
+
+            def limit(self, _count: int) -> "ScopedClient":
+                return self
+
+            def execute(self) -> SimpleNamespace:
+                return SimpleNamespace(data=[{"id": "worker-1", "owner_id": "user-a"}])
+
+        scoped_client = ScopedClient()
+        captured: dict[str, object] = {}
+
+        class SpyOrchestrator(RealAgentOrchestrator):
+            def __init__(self, owner_id: str | None = None, client: object | None = None) -> None:
+                captured["client"] = client
+                super().__init__(owner_id=owner_id, client=client)
+
+            def run_worker(self, worker_id: str) -> dict[str, object]:
+                return {"success": True, "worker_id": worker_id}
+
+        client.app.dependency_overrides[get_user_scoped_client] = lambda: scoped_client
+        monkeypatch.setattr(workers_module, "AgentOrchestrator", SpyOrchestrator)
+
+        response = client.post("/workers/worker-1/run", headers=auth_header("user-a"))
+
+        assert response.status_code == HTTP_200_OK, response.text
+        assert captured["client"] is scoped_client
 
     def test_no_service_role_in_user_paths(self, client: TestClient) -> None:
         """Service role access is not used in normal user execution paths."""

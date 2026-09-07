@@ -104,10 +104,11 @@ async def run_mission(
     mission_id: str,
     mission: dict[str, Any] = Depends(verify_mission_ownership),
     current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
 ) -> dict[str, Any]:
     """Execute a mission owned by the current user."""
 
-    orchestrator = AgentOrchestrator(owner_id=current_user_id)
+    orchestrator = AgentOrchestrator(owner_id=current_user_id, client=client)
     result = orchestrator.run_mission(mission_id)
     if not result.get("success"):
         error = result.get("error") or "Mission execution failed"

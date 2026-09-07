@@ -136,7 +136,7 @@ async def run_worker(
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
-    orchestrator = AgentOrchestrator(owner_id=current_user_id)
+    orchestrator = AgentOrchestrator(owner_id=current_user_id, client=client)
     result = orchestrator.run_worker(worker_id)
     if not result.get("success"):
         error = result.get("error") or "Worker execution failed"
