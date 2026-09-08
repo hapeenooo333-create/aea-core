@@ -12,20 +12,36 @@ import os
 import sys
 import uuid
 import json
+import subprocess
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
-
-os.environ["SUPABASE_URL"] = "http://127.0.0.1:54321"
-os.environ["SUPABASE_ANON_KEY"] = "sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH"
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-DB_URL = "postgresql://test_user:testpass@localhost:54322/postgres"
+DB_URL = "postgresql://postgres:postgres@localhost:54322/postgres"
 
-def get_db():
+
+def get_supabase_config():
+    """Resolve local Supabase settings without embedding credentials."""
+    url = os.environ.get("SUPABASE_URL", "http://127.0.0.1:54321")
+    key = os.environ.get("SUPABASE_ANON_KEY")
+    if not key:
+        status = subprocess.run(
+            ["npx", "supabase", "status", "-o", "json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        key = json.loads(status.stdout)["ANON_KEY"]
+    return url, key
+
+def get_db(authenticated=False):
     conn = psycopg2.connect(DB_URL)
     conn.autocommit = True
+    if authenticated:
+        conn.cursor().execute("SET ROLE authenticated;")
     return conn
 
 def run_sql(conn, sql, params=None):
@@ -52,9 +68,21 @@ def cleanup():
     conn.commit()
     conn.close()
 
-def create_test_user(conn, email):
-    """Generate a test user UUID (auth.uid() reads from JWT, not auth.users table in tests)."""
-    user_id = str(uuid.uuid4())
+def create_test_user(email):
+    """Create an ephemeral local Auth user through the supported Auth API."""
+    url, key = get_supabase_config()
+    password = f"P1-6-{uuid.uuid4().hex}-local-test"
+    request = urllib.request.Request(
+        f"{url}/auth/v1/signup",
+        data=json.dumps({"email": email, "password": password}).encode(),
+        headers={"apikey": key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request) as response:
+        payload = json.load(response)
+    user_id = payload.get("user", {}).get("id")
+    if not user_id or not payload.get("access_token"):
+        raise RuntimeError("Local Supabase Auth did not create a test identity")
     return user_id
 
 def create_test_worker(conn, owner_id, name):
@@ -88,12 +116,12 @@ def main():
     results = []
 
     cleanup()
-    conn = get_db()
+    conn = get_db(authenticated=True)
 
     user_a_email = f"test_user_a_{uuid.uuid4().hex[:8]}@example.com"
     user_b_email = f"test_user_b_{uuid.uuid4().hex[:8]}@example.com"
-    user_a_id = create_test_user(conn, user_a_email)
-    user_b_id = create_test_user(conn, user_b_email)
+    user_a_id = create_test_user(user_a_email)
+    user_b_id = create_test_user(user_b_email)
 
     worker_a = create_test_worker(conn, user_a_id, f"test_worker_a_{uuid.uuid4().hex[:8]}")
     mission_a = create_test_mission(conn, user_a_id, f"test_mission_a_{uuid.uuid4().hex[:8]}")
@@ -253,24 +281,24 @@ def main():
         cur.execute("""
             INSERT INTO public.mission_steps (
                 id, mission_id, execution_id, step_name, worker_role, status,
-                attempt_index, idempotency_key, owner_id, created_at
+                attempt_index, idempotency_key, created_at
             ) VALUES (
                 %s, %s, %s, 'test_step', 'employee', 'in_progress',
-                0, %s, %s, now()
+                0, %s, now()
             );
-        """, (step_id, mission_a, exec_db_id, idempotency_step, user_a_id))
+        """, (step_id, mission_a, exec_db_id, idempotency_step))
         conn.commit()
 
         try:
             cur.execute("""
                 INSERT INTO public.mission_steps (
                     id, mission_id, execution_id, step_name, worker_role, status,
-                    attempt_index, idempotency_key, owner_id, created_at
+                        attempt_index, idempotency_key, created_at
                 ) VALUES (
                     %s, %s, %s, 'test_step', 'employee', 'in_progress',
-                    0, %s, %s, now()
+                        0, %s, now()
                 );
-            """, (str(uuid.uuid4()), mission_a, exec_db_id, idempotency_step, user_a_id))
+                """, (str(uuid.uuid4()), mission_a, exec_db_id, idempotency_step))
             conn.commit()
             print(f"[FAIL] {test_name} - Duplicate step claim succeeded")
             results.append(("FAIL", test_name))
@@ -304,12 +332,12 @@ def main():
             cur.execute("""
                 INSERT INTO public.mission_steps (
                     id, mission_id, execution_id, step_name, status,
-                    attempt_index, idempotency_key, result, owner_id, created_at
+                    attempt_index, idempotency_key, result, created_at
                 ) VALUES (
                     gen_random_uuid(), %s, %s, %s, 'completed',
-                    0, %s, %s, %s, now()
+                    0, %s, %s, now()
                 );
-            """, (mission_a, exec_db_id, f"step_{i}", f"step_{uuid.uuid4().hex[:8]}", '{"output": "result"}', user_a_id))
+            """, (mission_a, exec_db_id, f"step_{i}", f"step_{uuid.uuid4().hex[:8]}", '{"output": "result"}'))
         conn.commit()
 
         cur.execute("""
@@ -403,7 +431,7 @@ def main():
     try:
         required_columns = {
             'execution_id', 'attempt_index', 'idempotency_key',
-            'started_at', 'completed_at', 'result', 'retry_category', 'owner_id'
+            'started_at', 'completed_at', 'result', 'retry_category'
         }
 
         cur = conn.cursor()

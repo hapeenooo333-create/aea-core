@@ -29,7 +29,7 @@ ALTER TABLE public.mission_steps
 
 -- Indexes for execution tracking
 CREATE INDEX IF NOT EXISTS idx_mission_steps_execution_id ON public.mission_steps (execution_id);
-CREATE INDEX IF NOT EXISTS idx_mission_steps_idempotency_key ON public.mission_steps (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mission_steps_idempotency_key ON public.mission_steps (idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_mission_steps_attempt_index ON public.mission_steps (execution_id, attempt_index);
 
 -- ============================================================================
@@ -83,14 +83,46 @@ CREATE INDEX IF NOT EXISTS idx_mission_executions_created_at_desc ON public.miss
 ALTER TABLE public.mission_executions ENABLE ROW LEVEL SECURITY;
 
 -- mission_executions: root resource, owner-scoped via owner_id = auth.uid()
-CREATE POLICY IF NOT EXISTS mission_executions_select_own ON public.mission_executions FOR SELECT
-    USING (owner_id = auth.uid());
-CREATE POLICY IF NOT EXISTS mission_executions_insert_own ON public.mission_executions FOR INSERT
-    WITH CHECK (owner_id = auth.uid());
-CREATE POLICY IF NOT EXISTS mission_executions_update_own ON public.mission_executions FOR UPDATE
-    USING (owner_id = auth.uid()) WITH CHECK (owner_id = auth.uid());
-CREATE POLICY IF NOT EXISTS mission_executions_delete_own ON public.mission_executions FOR DELETE
-    USING (owner_id = auth.uid());
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'mission_executions'
+          AND policyname = 'mission_executions_select_own'
+    ) THEN
+        CREATE POLICY mission_executions_select_own ON public.mission_executions FOR SELECT
+            USING (owner_id = auth.uid());
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'mission_executions'
+          AND policyname = 'mission_executions_insert_own'
+    ) THEN
+        CREATE POLICY mission_executions_insert_own ON public.mission_executions FOR INSERT
+            WITH CHECK (owner_id = auth.uid());
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'mission_executions'
+          AND policyname = 'mission_executions_update_own'
+    ) THEN
+        CREATE POLICY mission_executions_update_own ON public.mission_executions FOR UPDATE
+            USING (owner_id = auth.uid()) WITH CHECK (owner_id = auth.uid());
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'mission_executions'
+          AND policyname = 'mission_executions_delete_own'
+    ) THEN
+        CREATE POLICY mission_executions_delete_own ON public.mission_executions FOR DELETE
+            USING (owner_id = auth.uid());
+    END IF;
+END
+$$;
 
 -- mission_steps: already RLS-enabled via parent mission (sprint7_2g).
 -- The existing policies use EXISTS (SELECT 1 FROM public.missions WHERE missions.id = mission_steps.mission_id AND missions.owner_id = auth.uid()).
@@ -100,6 +132,7 @@ CREATE POLICY IF NOT EXISTS mission_executions_delete_own ON public.mission_exec
 -- 5. GRANTS
 -- ============================================================================
 
+REVOKE ALL ON public.mission_executions FROM anon;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.mission_executions TO authenticated;
 -- mission_steps already granted to authenticated (sprint7_2g)
 
@@ -182,10 +215,9 @@ DECLARE
     v_existing public.mission_steps%ROWTYPE;
     v_inserted public.mission_steps%ROWTYPE;
     v_mission_id UUID;
-    v_owner_id UUID;
 BEGIN
     -- Verify the execution exists and get owner for RLS.
-    SELECT mission_id, owner_id INTO v_mission_id, v_owner_id
+    SELECT mission_id INTO v_mission_id
         FROM public.mission_executions
         WHERE id = p_execution_id;
     IF NOT FOUND THEN
@@ -197,10 +229,10 @@ BEGIN
     -- prevents duplicate side effects from HTTP retry of the same attempt.
     INSERT INTO public.mission_steps (
         mission_id, execution_id, step_name, worker_role, status,
-        attempt_index, idempotency_key, started_at, completed_at, result, retry_category, owner_id, created_at
+        attempt_index, idempotency_key, started_at, completed_at, result, retry_category, created_at
     ) VALUES (
         v_mission_id, p_execution_id, 'claimed_step', 'employee', 'in_progress',
-        p_attempt_index, p_idempotency_key, now(), NULL, '{}'::jsonb, NULL, v_owner_id, now()
+        p_attempt_index, p_idempotency_key, now(), NULL, '{}'::jsonb, NULL, now()
     )
     RETURNING * INTO v_inserted;
 
