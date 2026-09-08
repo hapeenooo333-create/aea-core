@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from .action_engine import ActionEngine
+from .p1_7_contracts import sanitize_payload, validate_input_schema
 from .tool_registry import ToolRegistry
 
 
@@ -80,10 +81,11 @@ class ToolValidator:
             )
         tool_info = tool_response.get("tool", {})
 
-        # 3. Validate input payload against tool schema (if available)
-        schema = tool_info.get("schema")
+        # 3. Remove forbidden credentials before validation and execution.
+        safe_payload = sanitize_payload(payload)
+        schema = tool_info.get("input_schema") or tool_info.get("schema")
         if schema:
-            validation_error = self._validate_payload(payload, schema)
+            validation_error = self._validate_payload(safe_payload, schema)
             if validation_error:
                 raise ToolSafetyError(
                     f"Invalid payload for '{action_type}': {validation_error}",
@@ -91,12 +93,12 @@ class ToolValidator:
                 )
 
         # 4. Get action classification (risk level, approval requirement)
-        envelope = self._action_engine.create_action_envelope(action_type, payload)
+        envelope = self._action_engine.create_action_envelope(action_type, safe_payload)
 
         # 5. Prepare execution context
         return {
             "action_type": action_type,
-            "payload": payload,
+            "payload": safe_payload,
             "envelope": envelope,
             "tool_info": tool_info,
             "execution_ready": True,
@@ -112,32 +114,7 @@ class ToolValidator:
         Returns:
             Error message string if invalid, None if valid.
         """
-        if not isinstance(payload, dict):
-            return "Payload must be a dictionary"
-
-        # Required fields
-        required = schema.get("required", [])
-        for field in required:
-            if field not in payload:
-                return f"Required field '{field}' is missing"
-
-        # Type validation for properties
-        properties = schema.get("properties", {})
-        for field, expected in properties.items():
-            if field not in payload:
-                continue
-            value = payload[field]
-            expected_type = expected.get("type")
-            if not self._check_type(value, expected_type):
-                return f"Field '{field}': expected type '{expected_type}', got '{type(value).__name__}'"
-
-        # No additional properties if not allowed
-        if not schema.get("additionalProperties", True):
-            for field in payload:
-                if field not in properties:
-                    return f"Unexpected field '{field}' not allowed by schema"
-
-        return None
+        return validate_input_schema(payload, schema)
 
     @staticmethod
     def _check_type(value: Any, expected_type: str | None) -> bool:
@@ -206,6 +183,7 @@ class SafeActionExecutor:
             return {"success": False, "error": str(e), "reason": e.reason}
 
         envelope = prepared["envelope"]
+        safe_payload = prepared["payload"]
         requires_approval = envelope.get("requires_approval", False)
         risk_level = envelope.get("risk_level", "moderate")
 
@@ -214,7 +192,7 @@ class SafeActionExecutor:
             return self._execute_with_approval(
                 mission_id=mission_id,
                 action_type=action_type,
-                payload=payload,
+                payload=safe_payload,
                 risk_level=risk_level,
             )
 
@@ -223,11 +201,11 @@ class SafeActionExecutor:
             return self._worker_runtime.execute_connector_action(
                 mission_id=mission_id,
                 action_type=action_type,
-                payload=payload,
+                payload=safe_payload,
             )
 
         # Execute safe actions directly through ActionEngine
-        return self._tool_validator._action_engine.execute_action(action_type, payload)
+        return self._tool_validator._action_engine.execute_action(action_type, safe_payload)
 
     def _execute_with_approval(
         self,

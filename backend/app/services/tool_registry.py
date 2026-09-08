@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .p1_7_contracts import ToolContract
+
 
 class ToolRegistry:
     """Maintain a lightweight registry of available agent tools.
@@ -29,6 +31,20 @@ class ToolRegistry:
         description: str,
         tool_type: str = "internal",
         schema: dict[str, Any] | None = None,
+        *,
+        version: str = "1.0",
+        output_schema: dict[str, Any] | None = None,
+        capability: str | None = None,
+        platform: str | None = None,
+        operation: str | None = None,
+        risk_level: str | None = None,
+        requires_connection: bool = False,
+        requires_approval: bool | None = None,
+        supports_dry_run: bool = True,
+        idempotency_behavior: str = "not_applicable",
+        timeout: float = 30.0,
+        retry_policy: str = "bounded",
+        required_scopes: list[str] | None = None,
     ) -> dict[str, Any]:
         """Register a new tool definition.
 
@@ -46,15 +62,54 @@ class ToolRegistry:
         if not normalized_name:
             return {"success": False, "error": "Tool name is required"}
 
-        tool_payload: dict[str, Any] = {
-            "name": normalized_name,
-            "description": description or "",
-            "tool_type": tool_type or "internal",
-        }
-        if schema is not None:
-            tool_payload["schema"] = schema
+        canonical_risk = risk_level or ("WRITE_EXTERNAL" if tool_type == "external" else "READ_ONLY")
+        canonical_approval = requires_approval if requires_approval is not None else canonical_risk in {"WRITE_EXTERNAL", "DESTRUCTIVE"}
+        tool_payload = ToolContract(
+            tool_name=normalized_name,
+            version=version,
+            description=description or "",
+            input_schema=schema or {},
+            output_schema=output_schema or {},
+            capability=capability,
+            platform=platform,
+            operation=operation,
+            risk_level=canonical_risk,
+            requires_connection=requires_connection,
+            requires_approval=canonical_approval,
+            supports_dry_run=supports_dry_run,
+            idempotency_behavior=idempotency_behavior,
+            timeout=timeout,
+            retry_policy=retry_policy,
+        ).to_dict()
+        tool_payload["required_scopes"] = list(required_scopes or [])
         self._tools[normalized_name] = tool_payload
         return {"success": True, "tool": tool_payload}
+
+    def register_contract(
+        self,
+        contract: ToolContract,
+        *,
+        required_scopes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Register a canonical contract without exposing mutable registry state."""
+        return self.register_tool(
+            contract.tool_name,
+            contract.description,
+            schema=contract.input_schema,
+            version=contract.version,
+            output_schema=contract.output_schema,
+            capability=contract.capability,
+            platform=contract.platform,
+            operation=contract.operation,
+            risk_level=contract.risk_level,
+            requires_connection=contract.requires_connection,
+            requires_approval=contract.requires_approval,
+            supports_dry_run=contract.supports_dry_run,
+            idempotency_behavior=contract.idempotency_behavior,
+            timeout=contract.timeout,
+            retry_policy=contract.retry_policy,
+            required_scopes=required_scopes,
+        )
 
     def get_tool(self, name: str) -> dict[str, Any]:
         """Retrieve a specific tool definition.
