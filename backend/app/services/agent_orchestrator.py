@@ -16,6 +16,7 @@ from .memory_engine import AtlasMemoryEngine
 from .mission_engine import MissionEngine
 from .tool_registry import ToolRegistry
 from .worker_runtime import WorkerRuntime
+from .employee_vertical_slice import EmployeeVerticalSlice
 
 
 class AgentOrchestrator:
@@ -30,7 +31,23 @@ class AgentOrchestrator:
         self._action_engine = ActionEngine(owner_id=owner_id)
         self._tool_registry = ToolRegistry()
         self._memory_engine = AtlasMemoryEngine(owner_id=owner_id)
+        self._employee_slice = EmployeeVerticalSlice(
+            owner_id=owner_id or "anonymous",
+            client=client,
+        ) if owner_id else None
         self._wire_shared_services()
+
+    def run_objective(
+        self,
+        goal: str,
+        *,
+        mission_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run the P1-7B objective-to-report flow for the current user."""
+        if self._employee_slice is None:
+            return {"success": False, "status": "FAIL", "error": "Authenticated owner is required"}
+        return self._employee_slice.run(goal, mission_id=mission_id, metadata=metadata)
 
     def run_mission(self, mission_id: str) -> dict[str, Any]:
         """Run a single mission through the orchestrated workflow.

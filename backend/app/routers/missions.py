@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from app import database as database_module
 from app.dependencies import get_current_user_id, get_user_scoped_client, verify_mission_ownership
 from app.services.agent_orchestrator import AgentOrchestrator
+from app.services.employee_vertical_slice import EmployeeVerticalSlice
 from app.services.mission_engine import MissionEngine
 
 router = APIRouter(prefix="/missions", tags=["missions"])
@@ -24,6 +25,14 @@ class MissionCreateRequest(BaseModel):
     priority: str | None = None
 
     model_config = ConfigDict(extra="allow")
+
+
+class ObjectiveRunRequest(BaseModel):
+    """Structured user goal for the P1-7B employee slice."""
+
+    goal: str
+    mission_id: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 def _status_code_for_error(error: str | None) -> int:
@@ -96,6 +105,19 @@ async def get_mission(
 ) -> dict[str, Any]:
     """Return one mission owned by the current user."""
     return mission
+
+
+@router.post("/objective")
+async def run_objective(
+    request: Request,
+    body: ObjectiveRunRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    client: Any = Depends(get_user_scoped_client),
+) -> dict[str, Any]:
+    """Run one authenticated objective through the P1-7B employee flow."""
+
+    employee = EmployeeVerticalSlice(owner_id=current_user_id, client=client)
+    return employee.run(body.goal, mission_id=body.mission_id, metadata=body.metadata)
 
 
 @router.post("/{mission_id}/run")
