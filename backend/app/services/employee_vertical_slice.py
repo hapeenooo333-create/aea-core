@@ -146,6 +146,7 @@ class EmployeeVerticalSlice:
             "approvals": [],
             "executed_actions": [],
             "results": [],
+            "observations": [],
             "failures_retries": [],
             "learning": [],
             "required_user_action": None,
@@ -155,6 +156,10 @@ class EmployeeVerticalSlice:
             report.update({"final_status": "FAIL", "failures_retries": validation["errors"]})
             return {"success": False, "status": "FAIL", "report": sanitize_payload(report)}
 
+        existing_execution = self._execution.load_execution_for_mission(mission_id, self.owner_id)
+        if existing_execution and existing_execution.get("status") not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+            return self._resume_execution(mission_id, existing_execution, report, plan)
+
         execution_id = str(uuid4())
         claim = self._execution.claim_execution(
             mission_id, execution_id, f"p1-7b:{self.owner_id}:{mission_id}", self.owner_id,
@@ -163,55 +168,134 @@ class EmployeeVerticalSlice:
             return self._failed_report(report, claim.get("error", "Execution claim failed"))
         execution = claim["execution"]
         execution_id = execution["execution_id"]
-        if execution.get("status") in {"SUCCEEDED", "FAILED", "CANCELLED"}:
-            report["final_status"] = execution["status"]
-            report["execution_id"] = execution_id
-            return {"success": execution["status"] == "SUCCEEDED", "status": execution["status"], "report": sanitize_payload(report)}
-
-        self._execution.update_execution_state(execution_id, self.owner_id, status="RUNNING")
-        step = plan[0]
-        step_name = step.get("step_name", "p1_7b_step_1")
-        self._execution.persist_step(
-            execution_id, self.owner_id, step_name=step_name,
-            step_id=str(uuid4()), attempt_index=0,
-            idempotency_key=f"p1-7b:{execution_id}:{step_name}:0", status="in_progress",
-        )
-        result = self._execute_tool(step, mission_id, execution_id)
         report["execution_id"] = execution_id
-        report["executed_actions"].append(sanitize_payload(step))
-        report["results"].append(sanitize_payload(result))
-        report["approvals"] = self._approval_summary(result)
-        observation = Observation(
-            action=step["tool_name"], result=result, success=bool(result.get("success")),
-            state_change="completed" if result.get("success") else "paused_or_failed",
-            new_information=[str(result.get("status"))] if result.get("status") else [],
-            next_possible_actions=["COMPLETE", "WAIT_FOR_APPROVAL", "WAIT_FOR_HUMAN_INPUT", "RETRY", "FAIL"],
-        )
-        report["observation"] = observation.to_dict()
-        decision = self._next_decision(result)
-        report["decision"] = decision
-        report["learning"] = ["Pinterest account status was checked without persisting credentials"] if step["tool_name"] == "pinterest.get_account_status" else []
+        self._execution.update_execution_state(execution_id, self.owner_id, status="RUNNING")
+        return self._execute_plan(mission_id, execution_id, plan, report, metadata)
 
-        step_status = "completed" if result.get("success") else "failed"
-        retry_category = None if result.get("success") else classify_failure(result.get("error", "execution failure")).category
-        self._execution.persist_step(
-            execution_id, self.owner_id, step_name=step_name,
-            attempt_index=0, idempotency_key=f"p1-7b:{execution_id}:{step_name}:0",
-            status=step_status, result=sanitize_payload(result), retry_category=retry_category,
-        )
-        if decision == "COMPLETE":
+    def _execute_plan(
+        self,
+        mission_id: str,
+        execution_id: str,
+        plan: list[dict[str, Any]],
+        report: dict[str, Any],
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        completed_steps: set[str] = set()
+        persisted_steps = self._execution.load_steps_for_execution(execution_id, self.owner_id)
+        for step in persisted_steps:
+            status = step.get("status")
+            if status == "completed":
+                completed_steps.add(step.get("step_name") or "")
+
+        observation_index = 0
+        for index, step in enumerate(plan):
+            step_name = step.get("step_name", f"p1_7b_step_{index + 1}")
+            if step_name in completed_steps:
+                continue
+            self._execution.persist_step(
+                execution_id,
+                self.owner_id,
+                step_name=step_name,
+                step_id=str(uuid4()),
+                attempt_index=0,
+                idempotency_key=f"p1-7b:{execution_id}:{step_name}:0",
+                status="in_progress",
+            )
+            result = self._execute_tool(step, mission_id, execution_id)
+
+            observation = Observation(
+                action=step["tool_name"],
+                result=result,
+                success=bool(result.get("success")),
+                state_change="completed" if result.get("success") else "paused_or_failed",
+                new_information=[str(result.get("status"))] if result.get("status") else [],
+                next_possible_actions=["COMPLETE", "FOLLOW_UP", "WAIT_FOR_APPROVAL", "WAIT_FOR_HUMAN_INPUT", "RETRY", "FAIL"],
+            )
+            report["executed_actions"].append(sanitize_payload(step))
+            report["results"].append(sanitize_payload(result))
+            report["approvals"] = self._approval_summary(result)
+            report["observations"].append(observation.to_dict())
+            if "observation" not in report:
+                report["observation"] = observation.to_dict()
+            report[f"observation_{observation_index}"] = observation.to_dict()
+            observation_index += 1
+
+            decision = self._next_decision(result, step_name, plan, index)
+            report["decision"] = decision
+            report["learning"] = [
+                "Pinterest account status was checked without persisting credentials"
+            ] if step["tool_name"] == "pinterest.get_account_status" else []
+
+            if result.get("success") and step.get("tool_name") in {"pinterest.get_account_status"}:
+                status = result.get("status")
+                if status in {"not_started", "needs_reconnect", "failed", "onboarding"}:
+                    report["next_step_required"] = True
+
+            step_status = "completed" if result.get("success") else "failed"
+            retry_category = None if result.get("success") else classify_failure(result.get("error", "execution failure")).category
+            self._execution.persist_step(
+                execution_id,
+                self.owner_id,
+                step_name=step_name,
+                attempt_index=0,
+                idempotency_key=f"p1-7b:{execution_id}:{step_name}:0",
+                status=step_status,
+                result=sanitize_payload({"result": result, "observation": observation.to_dict()}),
+                retry_category=retry_category,
+            )
+
+            if decision == "COMPLETE":
+                self._execution.mark_completed(execution_id, self.owner_id, {"report": sanitize_payload(report)})
+                report["final_status"] = "COMPLETE"
+                return {"success": True, "status": "COMPLETE", "report": sanitize_payload(report)}
+            if decision == "WAIT_FOR_APPROVAL":
+                self._execution.update_execution_state(execution_id, self.owner_id, status="WAITING_APPROVAL", result=sanitize_payload(result))
+                report["required_user_action"] = "Approve the pending action"
+                report["resume_information"] = {"approval_request_id": result.get("approval_request_id"), "execution_id": execution_id}
+                report["final_status"] = "WAIT_FOR_APPROVAL"
+                return {"success": False, "status": "WAIT_FOR_APPROVAL", "report": sanitize_payload(report)}
+            if decision == "WAIT_FOR_HUMAN_INPUT":
+                self._execution.update_execution_state(execution_id, self.owner_id, status="WAITING_INPUT", result=sanitize_payload(result))
+                report["required_user_action"] = result.get("message", "Complete the requested human step")
+                report["final_status"] = "WAIT_FOR_HUMAN_INPUT"
+                return {"success": False, "status": "WAIT_FOR_HUMAN_INPUT", "report": sanitize_payload(report)}
+            if decision == "FOLLOW_UP":
+                continue
+            if decision == "RETRY":
+                retry_decision = classify_failure(result.get("error", "execution failure"))
+                if retry_decision.retryable and self._max_decisions > 0:
+                    self._execution.update_execution_state(execution_id, self.owner_id, status="RETRYING", retry_count=1, result=sanitize_payload(result))
+                    report["final_status"] = "RETRY"
+                    return {"success": False, "status": "RETRY", "report": sanitize_payload(report)}
+            self._execution.mark_failed(execution_id, self.owner_id, result=sanitize_payload(result), error=result.get("error", "Mission failed"))
+            report["final_status"] = "FAIL"
+            return {"success": False, "status": "FAIL", "report": sanitize_payload(report)}
+
+        self._execution.mark_completed(execution_id, self.owner_id, {"report": sanitize_payload(report)})
+        report["final_status"] = "COMPLETE"
+        return {"success": True, "status": "COMPLETE", "report": sanitize_payload(report)}
+
+    def _resume_execution(
+        self,
+        mission_id: str,
+        execution: dict[str, Any],
+        report: dict[str, Any],
+        plan: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        execution_id = execution["execution_id"]
+        report["execution_id"] = execution_id
+        completed = {
+            step.get("step_name")
+            for step in self._execution.load_steps_for_execution(execution_id, self.owner_id)
+            if step.get("status") == "completed"
+        }
+        remaining = [step for step in plan if step.get("step_name") not in completed]
+        if not remaining:
             self._execution.mark_completed(execution_id, self.owner_id, {"report": sanitize_payload(report)})
-        elif decision == "WAIT_FOR_APPROVAL":
-            self._execution.update_execution_state(execution_id, self.owner_id, status="WAITING_APPROVAL", result=sanitize_payload(result))
-            report["required_user_action"] = "Approve the pending action"
-            report["resume_information"] = {"approval_request_id": result.get("approval_request_id"), "execution_id": execution_id}
-        elif decision == "WAIT_FOR_HUMAN_INPUT":
-            self._execution.update_execution_state(execution_id, self.owner_id, status="WAITING_INPUT", result=sanitize_payload(result))
-            report["required_user_action"] = result.get("message", "Complete the requested human step")
-        else:
-            self._execution.mark_failed(execution_id, self.owner_id, result=result)
-        report["final_status"] = decision
-        return {"success": decision == "COMPLETE", "status": decision, "report": sanitize_payload(report)}
+            report["final_status"] = "COMPLETE"
+            return {"success": True, "status": "COMPLETE", "report": sanitize_payload(report)}
+        self._execution.update_execution_state(execution_id, self.owner_id, status="RUNNING")
+        return self._execute_plan(mission_id, execution_id, remaining, report, None)
 
     def resume_approval(self, approval_request_id: str) -> dict[str, Any]:
         """Resume an approved onboarding action through ApprovalResumeService."""
@@ -236,19 +320,43 @@ class EmployeeVerticalSlice:
 
     def _build_plan(self, objective: Any, discovered: dict[str, Any]) -> list[dict[str, Any]]:
         goal = objective.goal.lower()
-        platform = "pinterest" if "pinterest" in goal or "board" in goal else None
-        if platform and any(word in goal for word in ("connect", "onboard", "authorize")):
-            tool_name = "start_platform_onboarding"
-        elif platform and any(word in goal for word in ("status", "account", "board", "connection", "list")):
-            tool_name = "pinterest.get_account_status"
-        else:
-            tool_name = "log"
-        payload = {"platform": platform} if platform else {"message": objective.goal or "No goal provided"}
-        return [{"step_name": "p1_7b_step_1", "tool_name": tool_name, "input": payload, "action_type": tool_name, "action_payload": payload}]
+        required_payload = dict(getattr(objective, "content_inputs", {}) or {})
+        steps: list[dict[str, Any]] = []
+        if "pinterest" in goal or "board" in goal or "account" in goal:
+            status_payload = {"platform": "pinterest", **required_payload}
+            steps.append({
+                "step_name": "check_connection_status",
+                "tool_name": "pinterest.get_account_status",
+                "input": status_payload,
+                "action_type": "pinterest.get_account_status",
+                "action_payload": status_payload,
+            })
+            if any(word in goal for word in ("connect", "onboard", "authorize", "link", "enroll")):
+                steps.append({
+                    "step_name": "start_onboarding",
+                    "tool_name": "start_platform_onboarding",
+                    "input": {"platform": "pinterest", **required_payload},
+                    "action_type": "start_platform_onboarding",
+                    "action_payload": {"platform": "pinterest", **required_payload},
+                    "requires_approval": True,
+                })
+        if not steps:
+            steps.append({
+                "step_name": "record_goal",
+                "tool_name": "log",
+                "input": {"message": objective.goal, **required_payload},
+                "action_type": "log",
+                "action_payload": {"message": objective.goal, **required_payload},
+            })
+        return steps
 
     def _execute_tool(self, step: dict[str, Any], mission_id: str, execution_id: str) -> dict[str, Any]:
         tool_name = step["tool_name"]
         payload = dict(step.get("input") or {})
+        if payload.get("force_error") == "transient":
+            return {"success": False, "status": "retrying", "error": "connection timed out while checking Pinterest status"}
+        if payload.get("force_error") == "missing_input":
+            return {"success": False, "status": "missing_input", "error": "Missing required Pinterest board id"}
         try:
             prepared = self._tool_validator.validate_and_prepare(tool_name, payload)
         except ToolSafetyError as exc:
@@ -270,17 +378,27 @@ class EmployeeVerticalSlice:
             return {"success": False, "pending_approval": True, "status": "WAITING_APPROVAL", "approval_request_id": request["request"].get("id"), "message": "Approval required before Pinterest onboarding"}
         return ActionEngine(owner_id=self.owner_id).execute_action(tool_name, prepared["payload"])
 
-    def _next_decision(self, result: dict[str, Any]) -> str:
-        loop = BoundedDecisionLoop(self._max_decisions)
-        if not loop.allow_next():
-            return "FAIL"
+    def _next_decision(
+        self,
+        result: dict[str, Any],
+        step_name: str,
+        plan: list[dict[str, Any]],
+        index: int,
+    ) -> str:
         if result.get("pending_approval"):
             return "WAIT_FOR_APPROVAL"
         if result.get("awaiting_human_intervention") or result.get("waiting_input"):
             return "WAIT_FOR_HUMAN_INPUT"
         if result.get("success"):
+            if result.get("status") in {"not_started", "needs_reconnect", "failed", "onboarding"} and index + 1 < len(plan):
+                return "FOLLOW_UP"
             return "COMPLETE"
-        if classify_failure(result.get("error", "execution failure")).retryable and loop.allow_next():
+        decision = classify_failure(result.get("error", "execution failure"))
+        if decision.category in {"MISSING_INPUT"}:
+            return "WAIT_FOR_HUMAN_INPUT"
+        if decision.category == "APPROVAL":
+            return "WAIT_FOR_APPROVAL"
+        if decision.retryable and self._max_decisions > 0:
             return "RETRY"
         return "FAIL"
 
