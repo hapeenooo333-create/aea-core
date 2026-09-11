@@ -83,3 +83,64 @@ def test_missing_input_pauses_without_guessing():
     assert result["status"] in {"WAIT_FOR_APPROVAL", "WAIT_FOR_HUMAN_INPUT", "FAIL"}
     if result["status"] == "WAIT_FOR_HUMAN_INPUT":
         assert result["report"]["required_user_action"]
+
+
+def test_p1_7c_reaches_atomic_step_claim(monkeypatch):
+    employee = _slice()
+    calls = []
+    original = employee._execution.claim_step
+
+    def record_claim(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(employee._execution, "claim_step", record_claim)
+    employee.run("Check my Pinterest account status", mission_id="mission-claim")
+
+    assert calls
+
+
+def test_p1_7c_durable_mode_rejects_database_failure():
+    class FailingClient:
+        def rpc(self, *args, **kwargs):
+            raise RuntimeError("database unavailable")
+
+        def table(self, *args, **kwargs):
+            raise RuntimeError("database unavailable")
+
+    service = MissionExecutionService(client=FailingClient(), durable_required=True)
+    result = service.claim_step(
+        execution_id="00000000-0000-0000-0000-000000000001",
+        owner_id="00000000-0000-0000-0000-000000000002",
+        step_id="00000000-0000-0000-0000-000000000003",
+        attempt_index=0,
+        idempotency_key="step:durable:0",
+    )
+
+    assert result["success"] is False
+    assert not service._memory_steps
+
+
+def test_p1_7c_retry_attempt_is_not_reset_on_resume(monkeypatch):
+    employee = _slice()
+    monkeypatch.setattr(
+        employee,
+        "_execute_tool",
+        lambda *args, **kwargs: {"success": False, "error": "connection timed out"},
+    )
+    first = employee.run(
+        "Check my Pinterest connection",
+        mission_id="mission-retry-progress",
+    )
+    assert first["status"] == "RETRY"
+    execution_id = first["report"]["execution_id"]
+    steps = employee._execution.load_steps_for_execution(execution_id, "user-a")
+    assert steps[0]["attempt_index"] == 0
+
+    second = employee.run(
+        "Check my Pinterest connection",
+        mission_id="mission-retry-progress",
+    )
+    assert second["status"] == "RETRY"
+    steps = employee._execution.load_steps_for_execution(execution_id, "user-a")
+    assert {step["attempt_index"] for step in steps} == {0, 1}

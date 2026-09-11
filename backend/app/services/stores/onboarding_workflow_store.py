@@ -3,11 +3,9 @@
 Backed by ``public.onboarding_workflows`` (see
 ``database/migrations/sprint7_2b_platform_connectors.sql``).
 
-The store follows the same defensive pattern used elsewhere in the codebase:
-- Supabase is preferred when configured.
-- An in-memory dict is used as a safe fallback when Supabase is unavailable.
-- All exceptions during DB I/O are caught and degrade to the in-memory path
-  so callers never see a hard error from the storage layer.
+        Legacy callers may use the in-memory fallback when no client is configured.
+        Strict P1-7C callers fail closed when the database cannot prove a workflow
+        read or write succeeded.
 
 The store never persists OAuth secrets, tokens, or authorization codes.
 ``checkpoint_data`` and ``step_history`` are stored as JSONB and are
@@ -36,7 +34,7 @@ TABLE_NAME = "onboarding_workflows"
 class OnboardingWorkflowStore:
     """Persist onboarding workflow records with optional DB backing."""
 
-    def __init__(self, client: Any | None = None) -> None:
+    def __init__(self, client: Any | None = None, *, durable_required: bool = False) -> None:
         """Initialize the store.
 
         Args:
@@ -44,6 +42,7 @@ class OnboardingWorkflowStore:
                 store resolves ``app.database.supabase_client`` lazily.
         """
         self._explicit_client = client
+        self._durable_required = durable_required
         self._memory_store: dict[str, dict[str, Any]] = {}
         # Lock that serializes get_or_create_for_approval across threads
         # in this process. The database is the durable authority; this
@@ -104,8 +103,12 @@ class OnboardingWorkflowStore:
                         "success": True,
                         "workflow": self._normalize_row(response.data[0], record),
                     }
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    return {"success": False, "error": f"Workflow persistence failed: {exc}"}
+
+        if self._durable_required:
+            return {"success": False, "error": "Durable workflow persistence is unavailable"}
 
         # Fallback to in-memory storage
         self._memory_store[workflow_id] = record
@@ -133,8 +136,11 @@ class OnboardingWorkflowStore:
                 rows = response.data or []
                 if rows:
                     return self._normalize_row(rows[0], None)
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    raise RuntimeError(f"Workflow read failed: {exc}") from exc
+            if self._durable_required:
+                return None
 
         record = self._memory_store.get(workflow_id)
         if record is not None:
@@ -183,8 +189,12 @@ class OnboardingWorkflowStore:
                         "success": True,
                         "workflow": self._normalize_row(rows[0], None),
                     }
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    return {"success": False, "error": f"Workflow update failed: {exc}"}
+
+            if self._durable_required:
+                return {"success": False, "error": "Durable workflow update is unavailable"}
 
         # In-memory fallback
         existing = self._memory_store.get(workflow_id)
@@ -231,8 +241,11 @@ class OnboardingWorkflowStore:
                 rows = response.data or []
                 if rows:
                     return self._normalize_row(rows[0], None)
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    raise RuntimeError(f"Workflow read failed: {exc}") from exc
+            if self._durable_required:
+                return None
 
         for record in self._memory_store.values():
             if record.get("started_by_approval_id") == approval_id:
@@ -317,8 +330,12 @@ class OnboardingWorkflowStore:
                                 "workflow": self._normalize_row(workflow_json, None),
                                 "created": created,
                             }
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    return {"success": False, "error": f"Workflow claim failed: {exc}"}
+
+            if self._durable_required:
+                return {"success": False, "error": "Durable workflow claiming is unavailable"}
 
         # In-memory fallback. The lock makes the get-or-create atomic
         # within this process. A real concurrent process can still race
@@ -381,8 +398,11 @@ class OnboardingWorkflowStore:
                     if normalized:
                         results.append(normalized)
                 return results
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    raise RuntimeError(f"Workflow list failed: {exc}") from exc
+            if self._durable_required:
+                return []
 
         for record in self._memory_store.values():
             if record.get("worker_id") != worker_id:

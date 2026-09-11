@@ -172,6 +172,7 @@ class PinterestConnector(BaseConnector):
         worker_id: str,
         mission_id: str | None = None,
         approval_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Start a Pinterest onboarding workflow.
 
@@ -244,6 +245,8 @@ class PinterestConnector(BaseConnector):
                     "success": True,
                     "status": existing.get("status") or "awaiting_human",
                     "workflow_id": existing.get("workflow_id"),
+                    "aea_operation_key": idempotency_key,
+                    "provider_idempotency": "unsupported",
                     "platform": "pinterest",
                     "current_step": existing.get("current_step") or 1,
                     "total_steps": existing.get("total_steps") or 3,
@@ -255,7 +258,11 @@ class PinterestConnector(BaseConnector):
                     "started_by_approval_id": existing.get("started_by_approval_id"),
                     "reused_existing_workflow": claim.get("created") is False,
                 }
-            # If the claim call failed, fall through to the legacy path.
+            return {
+                "success": False,
+                "status": "FAILED",
+                "error": claim.get("error", "Workflow claim failed"),
+            }
 
         # Legacy / no-approval path: always create a fresh workflow.
         workflow_id = str(uuid4())
@@ -301,6 +308,8 @@ class PinterestConnector(BaseConnector):
             "updated_at": current_time,
             "step_history": list(step_history),
             "checkpoint_data": dict(checkpoint_data),
+            "aea_operation_key": idempotency_key,
+            "provider_idempotency": "unsupported",
         }
 
         # Persist via the store. The store itself manages DB-first writes
@@ -332,6 +341,8 @@ class PinterestConnector(BaseConnector):
             "checkpoint_type": "oauth_authorization_required",
             "instructions": checkpoint_data["instructions"],
             "metadata": checkpoint_data["metadata"],
+            "aea_operation_key": idempotency_key,
+            "provider_idempotency": "unsupported",
         }
 
     def resume_onboarding(self, workflow_id: str, human_input: dict[str, Any]) -> dict[str, Any]:
@@ -388,8 +399,7 @@ class PinterestConnector(BaseConnector):
                 step_history=step_history,
             )
             if not update_result.get("success"):
-                # Maintain local cache as last resort.
-                self._onboarding_workflows[workflow_id] = dict(workflow)
+                return update_result
 
             # Mark the platform connection as connected for the worker.
             worker_id = workflow.get("worker_id")

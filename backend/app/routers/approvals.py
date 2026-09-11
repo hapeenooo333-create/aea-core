@@ -12,6 +12,8 @@ from app.services.approval_resume_service import ApprovalResumeService
 from app.services.connectors.pinterest_connector import PinterestConnector
 from app.services.connectors.registry import ConnectorRegistry
 from app.services.human_intervention import HumanInterventionManager
+from app.services.mission_execution_service import MissionExecutionService
+from app.services.stores.onboarding_workflow_store import OnboardingWorkflowStore
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
@@ -20,7 +22,7 @@ def _build_resume_service(current_user_id: str | None = None) -> ApprovalResumeS
     """Construct an ``ApprovalResumeService`` with the canonical registry."""
 
     registry = ConnectorRegistry()
-    registry.register(PinterestConnector())
+    registry.register(PinterestConnector(workflow_store=OnboardingWorkflowStore(durable_required=True)))
     return ApprovalResumeService(
         approval_gateway=ApprovalGateway(),
         connector_registry=registry,
@@ -63,16 +65,17 @@ def _get_approval_gateway(client: Any | None = None) -> ApprovalGateway:
     return ApprovalGateway(client=client)
 
 
-def _get_resume_service(current_user_id: str) -> ApprovalResumeService:
+def _get_resume_service(current_user_id: str, client: Any | None = None) -> ApprovalResumeService:
     """Get an ApprovalResumeService scoped to the current user."""
-    client = None
-    try:
-        from app.dependencies import get_user_scoped_client
-        client = get_user_scoped_client(request=None)  # type: ignore
-    except Exception:
-        pass
     registry = ConnectorRegistry()
-    registry.register(PinterestConnector())
+    registry.register(
+        PinterestConnector(
+            workflow_store=OnboardingWorkflowStore(
+                client=client,
+                durable_required=True,
+            ),
+        ),
+    )
     return ApprovalResumeService(
         approval_gateway=ApprovalGateway(client=client),
         connector_registry=registry,
@@ -143,7 +146,10 @@ async def approve_approval(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error))
 
     approval = result.get("request")
-    resume_result = resume_service.resume(approval_id, current_user_id=current_user_id)
+    resume_result = _get_resume_service(current_user_id, client).resume(
+        approval_id,
+        current_user_id=current_user_id,
+    )
     return {
         "success": True,
         "approval": approval,
@@ -179,5 +185,20 @@ async def reject_approval(
     if not result.get("success"):
         error = result.get("error", "Failed to reject request")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error))
+
+    rejected_request = result.get("request") or approval
+    execution_id = (rejected_request.get("payload") or {}).get("execution_id")
+    if execution_id:
+        terminal = MissionExecutionService(client=client, durable_required=True).mark_failed(
+            execution_id,
+            current_user_id,
+            error="Approval rejected",
+            result={"decision": "REJECTED", "approval_request_id": approval_id},
+        )
+        if not terminal.get("success"):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=terminal.get("error", "Failed to persist rejected execution"),
+            )
 
     return {"success": True, "approval": result.get("request")}

@@ -742,6 +742,8 @@ class EmployeeEngine:
             status="pending",
             result=result,
         )
+        if not persist_result.get("success"):
+            return persist_result
 
         # Update execution state to WAITING_APPROVAL
         update_result = self._execution_service.update_execution_state(
@@ -749,6 +751,8 @@ class EmployeeEngine:
             status="WAITING_APPROVAL",
             current_step_index=execution.get("current_step_index", 0),
         )
+        if not update_result.get("success"):
+            return update_result
 
         return {
             "success": False,
@@ -794,12 +798,16 @@ class EmployeeEngine:
             status="pending",
             result=result,
         )
+        if not persist_result.get("success"):
+            return persist_result
 
         update_result = self._execution_service.update_execution_state(
             execution_id, worker_id,
             status="WAITING_INPUT",
             current_step_index=execution.get("current_step_index", 0),
         )
+        if not update_result.get("success"):
+            return update_result
 
         return {
             "success": False,
@@ -1105,8 +1113,12 @@ class EmployeeEngine:
                 execution["execution_id"], worker_id,
                 result={"plan": plan_steps, "mission_id": mission_id},
             )
+            if not complete_result.get("success"):
+                return complete_result
             # Also mark mission as completed
-            self._mission_engine.complete_mission(mission_id, {"plan": plan_steps})
+            mission_result = self._mission_engine.complete_mission(mission_id, {"plan": plan_steps})
+            if not mission_result.get("success"):
+                return mission_result
             return {
                 "success": True,
                 "mission_id": mission_id,
@@ -1122,6 +1134,8 @@ class EmployeeEngine:
             execution["execution_id"], worker_id,
             error="No executable steps remaining but not all steps completed",
         )
+        if not fail_result.get("success"):
+            return fail_result
         return {
             "success": False,
             "mission_id": mission_id,

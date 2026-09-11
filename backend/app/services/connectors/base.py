@@ -150,7 +150,12 @@ class BaseConnector(ABC):
         """
 
     @abstractmethod
-    def start_onboarding(self, worker_id: str) -> dict[str, Any]:
+    def start_onboarding(
+        self,
+        worker_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         """Start a platform onboarding workflow.
 
         Args:
@@ -182,7 +187,13 @@ class BaseConnector(ABC):
             Dictionary describing resumed workflow state (same format as start_onboarding).
         """
 
-    def connect_account(self, worker_id: str, auth_data: dict[str, Any]) -> dict[str, Any]:
+    def connect_account(
+        self,
+        worker_id: str,
+        auth_data: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         """Establish a connection to a platform account.
 
         Default implementation raises NotImplementedError. Subclasses should override
@@ -197,7 +208,7 @@ class BaseConnector(ABC):
         """
         raise NotImplementedError(f"connect_account not implemented for {self.platform}")
 
-    def disconnect_account(self, worker_id: str) -> dict[str, Any]:
+    def disconnect_account(self, worker_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
         """Disconnect from a platform account.
 
         Default implementation raises NotImplementedError. Subclasses should override
@@ -211,7 +222,13 @@ class BaseConnector(ABC):
         """
         raise NotImplementedError(f"disconnect_account not implemented for {self.platform}")
 
-    def publish_content(self, worker_id: str, content: dict[str, Any]) -> dict[str, Any]:
+    def publish_content(
+        self,
+        worker_id: str,
+        content: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         """Publish content to the platform.
 
         Default implementation raises NotImplementedError. Subclasses should override

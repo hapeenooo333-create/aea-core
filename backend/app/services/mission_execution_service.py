@@ -3,16 +3,15 @@
 Provides durable storage for mission execution state and step lifecycle.
 All operations enforce ownership via owner_id and Supabase RLS.
 
-Follows the same defensive pattern used elsewhere in the codebase:
-- Supabase is preferred when configured.
-- An in-memory dict is used as a safe fallback when Supabase is unavailable.
-- All exceptions during DB I/O are caught and degrade to the in-memory path
-  so callers never see a hard error from the storage layer.
+Legacy callers may use the in-memory fallback when no client is configured.
+Strict P1-7C callers fail closed whenever the database cannot prove a read,
+claim, or write succeeded.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from threading import RLock
 from typing import Any
 from uuid import uuid4
 
@@ -33,6 +32,8 @@ VALID_EXECUTION_STATUSES = {
 }
 
 VALID_STEP_STATUSES = {"pending", "assigned", "in_progress", "completed", "failed"}
+DEFAULT_CLAIM_LEASE_SECONDS = 60
+_MEMORY_LOCK = RLock()
 
 VALID_RETRY_CATEGORIES = {
     "TRANSIENT", "VALIDATION", "AUTHORIZATION", "APPROVAL",
@@ -43,7 +44,7 @@ VALID_RETRY_CATEGORIES = {
 class MissionExecutionService:
     """Persist and query mission execution records with optional DB backing."""
 
-    def __init__(self, client: Any | None = None) -> None:
+    def __init__(self, client: Any | None = None, *, durable_required: bool = False) -> None:
         """Initialize the service.
 
         Args:
@@ -51,6 +52,7 @@ class MissionExecutionService:
                 service resolves ``app.database.supabase_client`` lazily.
         """
         self._explicit_client = client
+        self._durable_required = durable_required
         self._memory_executions: dict[str, dict[str, Any]] = {}
         self._memory_steps: dict[str, dict[str, Any]] = {}
 
@@ -106,8 +108,12 @@ class MissionExecutionService:
                 response = client.table(EXECUTION_TABLE).insert(record).execute()
                 if response.data:
                     return {"success": True, "execution": self._normalize_execution(response.data[0])}
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    return {"success": False, "error": f"Execution persistence failed: {exc}"}
+
+        if self._durable_required:
+            return {"success": False, "error": "Durable execution claiming is unavailable"}
 
         self._memory_executions[execution_id] = record
         return {"success": True, "execution": self._normalize_execution(record)}
@@ -132,8 +138,11 @@ class MissionExecutionService:
                 rows = response.data or []
                 if rows:
                     return self._normalize_execution(rows[0])
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    raise RuntimeError(f"Execution read failed: {exc}") from exc
+            if self._durable_required:
+                return None
 
         record = self._memory_executions.get(execution_id)
         if record is None:
@@ -178,8 +187,15 @@ class MissionExecutionService:
                     if execution["status"] not in ("SUCCEEDED", "FAILED", "CANCELLED"):
                         return execution
                     return None
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    raise RuntimeError(f"Execution read failed: {exc}") from exc
+
+            if self._durable_required:
+                return None
+
+        if self._durable_required:
+            return None
 
         # In-memory fallback
         for record in reversed(self._memory_executions.values()):
@@ -232,8 +248,12 @@ class MissionExecutionService:
                                 "execution": self._normalize_execution(workflow_json),
                                 "created": created,
                             }
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    return {"success": False, "error": f"Execution claim failed: {exc}"}
+
+        if self._durable_required:
+            return {"success": False, "error": "Durable execution claiming is unavailable"}
 
         # In-memory fallback
         with self._memory_lock():
@@ -269,6 +289,7 @@ class MissionExecutionService:
         retry_count: int | None = None,
         result: dict[str, Any] | None = None,
         completed_at: str | None = None,
+        started_at: str | None = None,
     ) -> dict[str, Any]:
         """Update mutable fields on an execution with ownership enforcement.
 
@@ -300,6 +321,8 @@ class MissionExecutionService:
             updates["result"] = result
         if completed_at is not None:
             updates["completed_at"] = completed_at
+        if started_at is not None:
+            updates["started_at"] = started_at
 
         client = self._client()
         if client is not None:
@@ -314,8 +337,12 @@ class MissionExecutionService:
                 rows = response.data or []
                 if rows:
                     return {"success": True, "execution": self._normalize_execution(rows[0])}
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    return {"success": False, "error": f"Execution update failed: {exc}"}
+
+        if self._durable_required:
+            return {"success": False, "error": "Durable execution updates are unavailable"}
 
         # In-memory fallback
         record = self._memory_executions.get(execution_id)
@@ -396,6 +423,9 @@ class MissionExecutionService:
         status: str = "in_progress",
         result: dict[str, Any] | None = None,
         retry_category: str | None = None,
+        operation_key: str | None = None,
+        claim_token: str | None = None,
+        lease_expires_at: str | None = None,
     ) -> dict[str, Any]:
         """Persist a step record for an execution.
 
@@ -433,7 +463,10 @@ class MissionExecutionService:
             "status": status,
             "attempt_index": attempt_index,
             "idempotency_key": idempotency_key,
+            "operation_key": operation_key or idempotency_key,
             "started_at": now if status == "in_progress" else None,
+            "claim_token": claim_token,
+            "lease_expires_at": lease_expires_at,
             "completed_at": now if status in ("completed", "failed") else None,
             "result": result or {},
             "retry_category": retry_category,
@@ -447,10 +480,77 @@ class MissionExecutionService:
                 response = client.table(STEP_TABLE).insert(record).execute()
                 if response.data:
                     return {"success": True, "step": self._normalize_step(response.data[0])}
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    return {"success": False, "error": f"Step persistence failed: {exc}"}
+
+        if self._durable_required:
+            return {"success": False, "error": "Durable step persistence is unavailable"}
 
         self._memory_steps[step_id] = record
+        return {"success": True, "step": self._normalize_step(record)}
+
+    def update_step(
+        self,
+        execution_id: str,
+        owner_id: str,
+        step_id: str,
+        *,
+        step_name: str | None = None,
+        status: str,
+        result: dict[str, Any] | None = None,
+        retry_category: str | None = None,
+        claim_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Update a previously claimed step without creating another row."""
+        if status not in VALID_STEP_STATUSES:
+            return {"success": False, "error": f"Invalid step status: {status}"}
+        if retry_category and retry_category not in VALID_RETRY_CATEGORIES:
+            return {"success": False, "error": f"Invalid retry category: {retry_category}"}
+
+        updates: dict[str, Any] = {
+            "status": status,
+            "result": result or {},
+            "completed_at": datetime.now(timezone.utc).isoformat()
+            if status in {"completed", "failed"}
+            else None,
+            "retry_category": retry_category,
+        }
+        if step_name:
+            updates["step_name"] = step_name
+        if claim_token:
+            updates["claim_token"] = claim_token
+        client = self._client()
+        if client is not None:
+            try:
+                query = (
+                    client.table(STEP_TABLE)
+                    .update(updates)
+                    .eq("id", step_id)
+                    .eq("execution_id", execution_id)
+                    .eq("owner_id", owner_id)
+                )
+                if claim_token:
+                    query = query.eq("claim_token", claim_token)
+                response = query.execute()
+                if response.data:
+                    return {"success": True, "step": self._normalize_step(response.data[0])}
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    return {"success": False, "error": f"Step update failed: {exc}"}
+
+        if self._durable_required:
+            return {"success": False, "error": "Durable step update is unavailable"}
+
+        record = self._memory_steps.get(step_id)
+        if record is None:
+            record = next(
+                (item for item in self._memory_steps.values() if item.get("id") == step_id),
+                None,
+            )
+        if record is None or record.get("execution_id") != execution_id:
+            return {"success": False, "error": f"Step {step_id} not found"}
+        record.update(updates)
         return {"success": True, "step": self._normalize_step(record)}
 
     def claim_step(
@@ -460,6 +560,10 @@ class MissionExecutionService:
         step_id: str,
         attempt_index: int,
         idempotency_key: str,
+        step_name: str = "claimed_step",
+        operation_key: str | None = None,
+        claim_token: str | None = None,
+        lease_seconds: int = DEFAULT_CLAIM_LEASE_SECONDS,
     ) -> dict[str, Any]:
         """Claim a step for execution with attempt isolation.
 
@@ -473,6 +577,10 @@ class MissionExecutionService:
         Returns:
             Dictionary with success flag, step record, and claimed flag.
         """
+        operation_key = operation_key or idempotency_key
+        claim_token = claim_token or str(uuid4())
+        now = datetime.now(timezone.utc)
+        lease_expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
         client = self._client()
         if client is not None:
             try:
@@ -483,6 +591,9 @@ class MissionExecutionService:
                         "p_step_id": step_id,
                         "p_attempt_index": attempt_index,
                         "p_idempotency_key": idempotency_key,
+                        "p_operation_key": operation_key,
+                        "p_claim_token": claim_token,
+                        "p_lease_seconds": lease_seconds,
                     },
                 ).execute()
                 data = getattr(response, "data", None) or []
@@ -497,29 +608,56 @@ class MissionExecutionService:
                                 "step": self._normalize_step(step_json),
                                 "claimed": claimed,
                             }
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    return {"success": False, "error": f"Durable step claim failed: {exc}"}
+
+        if self._durable_required:
+            return {"success": False, "error": "Durable step claiming is unavailable"}
 
         # In-memory fallback
-        with self._memory_lock():
+        with _MEMORY_LOCK:
             for record in self._memory_steps.values():
-                if record.get("idempotency_key") == idempotency_key:
+                if record.get("owner_id") == owner_id and record.get("idempotency_key") == idempotency_key:
                     return {"success": True, "step": self._normalize_step(record), "claimed": False}
+            related = [
+                record for record in self._memory_steps.values()
+                if record.get("execution_id") == execution_id
+                and record.get("owner_id") == owner_id
+                and record.get("operation_key") == operation_key
+            ]
+            latest = max(related, key=lambda item: item.get("attempt_index", 0), default=None)
+            if latest and latest.get("status") == "completed":
+                return {"success": True, "step": self._normalize_step(latest), "claimed": False}
+            if latest and latest.get("status") == "in_progress":
+                expiry = latest.get("lease_expires_at")
+                if expiry and datetime.fromisoformat(expiry.replace("Z", "+00:00")) > now:
+                    return {"success": True, "step": self._normalize_step(latest), "claimed": False}
+                latest.update({
+                    "status": "failed",
+                    "retry_category": "EXECUTION",
+                    "claim_token": None,
+                    "completed_at": now.isoformat(),
+                    "result": {"recovered": "stale_claim"},
+                })
 
             record: dict[str, Any] = {
                 "id": step_id,
                 "execution_id": execution_id,
-                "step_name": "claimed_step",
+                "step_name": step_name,
                 "worker_role": "employee",
                 "status": "in_progress",
                 "attempt_index": attempt_index,
                 "idempotency_key": idempotency_key,
-                "started_at": datetime.now(timezone.utc).isoformat(),
+                "operation_key": operation_key,
+                "started_at": now.isoformat(),
+                "claim_token": claim_token,
+                "lease_expires_at": lease_expires_at,
                 "completed_at": None,
                 "result": {},
                 "retry_category": None,
                 "owner_id": owner_id,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": now.isoformat(),
             }
             self._memory_steps[idempotency_key] = record
             return {"success": True, "step": self._normalize_step(record), "claimed": True}
@@ -551,8 +689,11 @@ class MissionExecutionService:
                 )
                 rows = response.data or []
                 return [self._normalize_step(row) for row in rows if self._normalize_step(row)]
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                if self._durable_required:
+                    raise RuntimeError(f"Step read failed: {exc}") from exc
+            if self._durable_required:
+                return []
 
         return [
             self._normalize_step(r)
@@ -606,7 +747,10 @@ class MissionExecutionService:
             "status": row.get("status"),
             "attempt_index": row.get("attempt_index", 0),
             "idempotency_key": row.get("idempotency_key"),
+            "operation_key": row.get("operation_key") or row.get("idempotency_key"),
             "started_at": row.get("started_at"),
+            "claim_token": row.get("claim_token") or row.get("claimed_by"),
+            "lease_expires_at": row.get("lease_expires_at"),
             "completed_at": row.get("completed_at"),
             "result": row.get("result") or {},
             "retry_category": row.get("retry_category"),
@@ -617,5 +761,4 @@ class MissionExecutionService:
     @staticmethod
     def _memory_lock() -> Any:
         """Return a process-local lock for in-memory fallback atomicity."""
-        from threading import RLock
-        return RLock()
+        return _MEMORY_LOCK

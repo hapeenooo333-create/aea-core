@@ -254,6 +254,7 @@ class MissionEngine:
             "assigned_worker": worker_id,
             "status": row.get("status"),
             "priority": row.get("priority"),
+            "owner_id": row.get("owner_id"),
             "result": row.get("result") or {},
             "error": row.get("error"),
             "created_at": row.get("created_at"),

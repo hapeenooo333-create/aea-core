@@ -111,7 +111,11 @@ class ApprovalResumeService:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def resume(self, approval_request_id: str) -> dict[str, Any]:
+    def resume(
+        self,
+        approval_request_id: str,
+        current_user_id: str | None = None,
+    ) -> dict[str, Any]:
         """Resume the operation associated with an approved approval request.
 
         Args:
@@ -130,6 +134,14 @@ class ApprovalResumeService:
             return self._fail(
                 "approval_not_found",
                 f"Approval request {approval_request_id} not found",
+            )
+
+        request_owner = request.get("owner_id")
+        if current_user_id and request_owner and request_owner != current_user_id:
+            return self._fail(
+                "approval_unauthorized",
+                "Authenticated user is not authorized to resume this approval",
+                approval=approval_request_id,
             )
 
         status_value = (request.get("status") or "").lower()
@@ -204,6 +216,7 @@ class ApprovalResumeService:
                 result = self._fail(
                     "resume_failed",
                     "No worker runtime configured to resume non-connector actions",
+                    operation_key=payload.get("operation_key"),
                     approval=approval_request_id,
                     action_type=action_type,
                 )
@@ -287,6 +300,7 @@ class ApprovalResumeService:
                     worker_id=worker_id,
                     platform=platform,
                     connector=connector,
+                    operation_key=payload.get("operation_key"),
                 )
             if action_type == "resume_platform_onboarding":
                 return self._handle_resume_onboarding(
@@ -343,12 +357,14 @@ class ApprovalResumeService:
         worker_id: str,
         platform: str,
         connector: Any,
+        operation_key: str | None = None,
     ) -> dict[str, Any]:
         """Handle resume of ``start_platform_onboarding``."""
         result = connector.start_onboarding(
             worker_id,
             mission_id=mission_id,
             approval_id=approval_request_id,
+            idempotency_key=operation_key,
         )
         workflow_id = result.get("workflow_id")
 
